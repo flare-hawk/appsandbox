@@ -1812,7 +1812,7 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
         ZeroMemory(&dm, sizeof(dm));
         dm.dmSize = sizeof(dm);
         if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) &&
-            dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0 && dm.dmDisplayFrequency > 0) {
+            dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0 && dm.dmDisplayFrequency > 1) {
             char disp_cfg[32];
             int dl = _snprintf_s(disp_cfg, sizeof(disp_cfg), _TRUNCATE,
                                  "%lux%lux%lu",
@@ -2834,12 +2834,18 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
        otherwise fall back to %ProgramData%\AppSandbox. */
     {
         wchar_t base_dir[MAX_PATH];
+        /* Templates always use the default path — scan_templates() and
+           asb_template_delete() are hardcoded to %ProgramData%\AppSandbox\
+           templates, so custom-path templates would be orphaned. */
+        if (is_template_create)
+            cfg.vhdx_base_dir[0] = L'\0';
+
         if (cfg.vhdx_base_dir[0] != L'\0') {
-            /* User-specified storage path. Validate length: the final
-               vhdx_path = base + \name + \disk.vhdx must fit MAX_PATH. */
+            /* User-specified storage path. Validate length: must fit MAX_PATH
+               for vhdx_path AND snapshot subpaths (\\snapshots\\<name>_<guid>.vhdx). */
             size_t base_len = wcslen(cfg.vhdx_base_dir);
             size_t name_len = wcslen(cfg.name);
-            if (base_len + name_len + 32 > MAX_PATH) {
+            if (base_len + name_len + 64 > MAX_PATH) {
                 asb_log(L"Error: Storage path too long (%zu chars + VM name).", base_len);
                 return E_INVALIDARG;
             }
@@ -2847,7 +2853,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             /* Strip trailing backslash to avoid double-backslash in paths */
             {
                 size_t bl = wcslen(base_dir);
-                while (bl > 1 && base_dir[bl - 1] == L'\\') base_dir[--bl] = L'\0';
+                while (bl > 3 && base_dir[bl - 1] == L'\\') base_dir[--bl] = L'\0';
             }
             /* Recursively create the base directory (handles nested paths
                like D:\VMs\AppSandbox where D:\VMs doesn't exist yet). */
