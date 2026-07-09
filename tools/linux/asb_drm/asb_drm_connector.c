@@ -131,13 +131,15 @@ void asb_build_edid(struct asb_device *asb)
 		e[77 + i] = name[i];
 	for (; i < 13; i++) e[77 + i] = (i == strlen(name)) ? 0x0a : 0x20;
 
-	/* Descriptor #3 (90..107) — range limits (0xFD) */
+	/* Descriptor #3 (90..107) - range limits (0xFD)
+	 * Max vertical Hz must be >= the configured refresh, or Mutter
+	 * will reject the preferred mode as out-of-range. */
 	e[90] = e[91] = e[92] = 0; e[93] = 0xfd; e[94] = 0;
 	e[95] = 24;        /* min vertical Hz */
-	e[96] = 75;        /* max vertical Hz */
+	e[96] = (asb->refresh > 75) ? asb->refresh : 75;  /* max vertical Hz */
 	e[97] = 30;        /* min horizontal kHz */
 	e[98] = 150;       /* max horizontal kHz */
-	e[99] = 220;       /* max pixel clock / 10 MHz → 2200 MHz cap */
+	e[99] = 220;       /* max pixel clock / 10 MHz -> 2200 MHz cap */
 	e[100] = 0x0a;
 	for (i = 101; i <= 107; i++) e[i] = 0x20;
 
