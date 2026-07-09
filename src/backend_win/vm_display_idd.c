@@ -112,6 +112,7 @@ typedef struct AudioFrameHeader {
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_SET_DIMENSIONS 4  /* host tells guest the current frame dimensions */
 
 /* Button IDs for INPUT_MOUSE_BUTTON */
 #define INPUT_BTN_LEFT      0
@@ -532,9 +533,9 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     /* Log non-move events only (moves are too noisy) */
     if (type != INPUT_MOUSE_MOVE) {
         static const wchar_t *type_names[] = {
-            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY"
+            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY", L"SET_DIMS"
         };
-        const wchar_t *name = type < 4 ? type_names[type] : L"?";
+        const wchar_t *name = type < 5 ? type_names[type] : L"?";
         idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
     }
 }
@@ -1284,6 +1285,18 @@ static void d3d_render_frame(VmDisplayIdd *d)
         (d->frame_width != d->frame_tex_width || d->frame_height != d->frame_tex_height)) {
         d3d_recreate_frame_texture(d, d->frame_width, d->frame_height);
     }
+    /* Auto-resize window to match guest resolution on first frame or
+     * resolution change. This runs on the window thread (via timer/MSG). */
+    if (d->frame_dirty && d->hwnd &&
+        (d->frame_width != d->frame_tex_width || d->frame_height != d->frame_tex_height)) {
+        DWORD style = (DWORD)GetWindowLongW(d->hwnd, GWL_STYLE);
+        DWORD exstyle = (DWORD)GetWindowLongW(d->hwnd, GWL_EXSTYLE);
+        RECT wr = { 0, 0, (LONG)d->frame_width, (LONG)d->frame_height };
+        AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+        SetWindowPos(d->hwnd, NULL, 0, 0,
+                     wr.right - wr.left, wr.bottom - wr.top,
+                     SWP_NOMOVE | SWP_NOZORDER);
+    }
     if (d->frame_dirty && d->frame_tex) {
         EnterCriticalSection(&d->frame_cs);
         hr = d->ctx->lpVtbl->Map(d->ctx,
@@ -1620,6 +1633,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->input_socket = input_s;
                     g_input_send_count = 0;
                     idd_log(d, L"Input connected + ready (GUID :0003).");
+                    /* Send current frame dimensions so mouse mapping is correct
+                     * from the very first input event. */
+                    if (d->frame_width > 0 && d->frame_height > 0)
+                        send_input(d, INPUT_SET_DIMENSIONS, d->frame_width, d->frame_height, 0);
                 } else {
                     idd_log(d, L"Input handshake failed - closing.");
                     closesocket(input_s);
@@ -1787,6 +1804,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
                             hdr.width, hdr.height, hdr.stride);
                     idd_log(d, L"Resolution changed to %ux%u.", hdr.width, hdr.height);
+                    /* Notify guest input handler of new frame dimensions
+                     * so mouse coordinate scaling is correct. */
+                    send_input(d, INPUT_SET_DIMENSIONS, hdr.width, hdr.height, 0);
                 } else {
                     LeaveCriticalSection(&d->frame_cs);
                     break;
@@ -1937,6 +1957,10 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     /* Compute outer window size so the client area is exactly DEFAULT_WIDTH x DEFAULT_HEIGHT */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
+        /* Remove resize border and maximize button: window is fixed-size.
+           It auto-resizes to match the guest's actual resolution when the
+           first frame arrives (see WM_IDD_FRAME_READY below). */
+        style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
         DWORD exstyle = 0;
         RECT wr = { 0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT };
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
