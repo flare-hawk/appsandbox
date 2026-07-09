@@ -1803,6 +1803,30 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
         asb_log(L"Linux hostname: staged /etc/appsandbox-hostname = %s", vm_name);
     }
 
+    /* Stage the host's display resolution + refresh rate so the guest's
+     * asb_drm module can match it at boot. Format: "WxHxR" e.g. "1920x1080x60".
+     * The firstboot script reads /etc/appsandbox-display-config and overrides
+     * the default modprobe.d-asb_drm.conf with these values. */
+    {
+        DEVMODEW dm;
+        ZeroMemory(&dm, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) &&
+            dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0 && dm.dmDisplayFrequency > 0) {
+            char disp_cfg[32];
+            int dl = _snprintf_s(disp_cfg, sizeof(disp_cfg), _TRUNCATE,
+                                 "%lux%lux%lu",
+                                 (unsigned long)dm.dmPelsWidth,
+                                 (unsigned long)dm.dmPelsHeight,
+                                 (unsigned long)dm.dmDisplayFrequency);
+            if (dl > 0) {
+                n += stage_marker_file(f, staging, L"display-config.marker",
+                                       disp_cfg, (size_t)dl,
+                                       L"/etc/appsandbox-display-config");
+                asb_log(L"Linux display config: staged /etc/appsandbox-display-config = %hs", disp_cfg);
+            }
+        }
+    }
     fclose(f);
     asb_log(L"Linux staging manifest written: %s (%d file(s))", manifest_path, n);
     return n;
@@ -1950,24 +1974,21 @@ static int detect_iso_kernel(const wchar_t *iso_path,
      *    FindFirstFileW doesn't reliably handle multi-`*` patterns on
      *    ISO 9660, so we enumerate subdirs and filter client-side. */
     {
-        wchar_t ldir[MAX_PATH];
-        swprintf_s(ldir, MAX_PATH, L"%c:\\pool\\main\\l", iso_drive);
+        wchar_t spec[MAX_PATH];
         WIN32_FIND_DATAW sfd;
-        HANDLE sfh = FindFirstFileW(ldir, &sfd);
-        /* If FindFirstFileW on a bare dir fails on ISO 9660, try with \* */
-        if (sfh == INVALID_HANDLE_VALUE) {
-            wchar_t spec[MAX_PATH];
-            swprintf_s(spec, MAX_PATH, L"%c:\\pool\\main\\l\\*", iso_drive);
-            sfh = FindFirstFileW(spec, &sfd);
-        }
+        /* FindFirstFileW requires a wildcard to enumerate directory contents.
+           A bare directory path always returns INVALID_HANDLE_VALUE. */
+        swprintf_s(spec, MAX_PATH, L"%c:\\pool\\main\\l\\*", iso_drive);
+        HANDLE sfh = FindFirstFileW(spec, &sfd);
         int found = 0;
         if (sfh != INVALID_HANDLE_VALUE) {
             do {
                 if (!(sfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
                 if (sfd.cFileName[0] == L'.') continue;
+                /* Guard against path overflow on malformed ISO dir names */
+                if (wcslen(sfd.cFileName) > MAX_PATH - 40) continue;
 
-                /* Search this subdir for linux-headers-*generic*.deb */
-                wchar_t spec[MAX_PATH];
+                /* Search this subdir for linux-headers-*.deb */
                 swprintf_s(spec, MAX_PATH,
                     L"%c:\\pool\\main\\l\\%s\\linux-headers-*.deb",
                     iso_drive, sfd.cFileName);
@@ -1975,7 +1996,8 @@ static int detect_iso_kernel(const wchar_t *iso_path,
                 HANDLE fh = FindFirstFileW(spec, &fd);
                 if (fh != INVALID_HANDLE_VALUE) {
                     do {
-                        if (!wcsstr(fd.cFileName, L"-generic_")) continue;
+                        /* Skip meta-packages (_all.deb); we need per-flavor */
+                        if (wcsstr(fd.cFileName, L"_all.deb")) continue;
                         const wchar_t *p = wcsstr(fd.cFileName, L"linux-headers-");
                         if (!p) continue;
                         p += wcslen(L"linux-headers-");
@@ -1995,21 +2017,16 @@ static int detect_iso_kernel(const wchar_t *iso_path,
             FindClose(sfh);
         }
 
-        /* Fallback: search for linux-image-<ver>-generic debs in pool/main/l subdirs */
+        /* Fallback: search for linux-image-*.deb in pool/main/l subdirs */
         if (!found) {
-            swprintf_s(ldir, MAX_PATH, L"%c:\\pool\\main\\l", iso_drive);
-            sfh = FindFirstFileW(ldir, &sfd);
-            if (sfh == INVALID_HANDLE_VALUE) {
-                wchar_t spec[MAX_PATH];
-                swprintf_s(spec, MAX_PATH, L"%c:\\pool\\main\\l\\*", iso_drive);
-                sfh = FindFirstFileW(spec, &sfd);
-            }
+            swprintf_s(spec, MAX_PATH, L"%c:\\pool\\main\\l\\*", iso_drive);
+            sfh = FindFirstFileW(spec, &sfd);
             if (sfh != INVALID_HANDLE_VALUE) {
                 do {
                     if (!(sfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
                     if (sfd.cFileName[0] == L'.') continue;
+                    if (wcslen(sfd.cFileName) > MAX_PATH - 40) continue;
 
-                    wchar_t spec[MAX_PATH];
                     swprintf_s(spec, MAX_PATH,
                         L"%c:\\pool\\main\\l\\%s\\linux-image-*.deb",
                         iso_drive, sfd.cFileName);
@@ -2017,7 +2034,7 @@ static int detect_iso_kernel(const wchar_t *iso_path,
                     HANDLE fh = FindFirstFileW(spec, &fd);
                     if (fh != INVALID_HANDLE_VALUE) {
                         do {
-                            if (!wcsstr(fd.cFileName, L"-generic_")) continue;
+                            if (wcsstr(fd.cFileName, L"_all.deb")) continue;
                             const wchar_t *p = wcsstr(fd.cFileName, L"linux-image-");
                             if (!p) continue;
                             p += wcslen(L"linux-image-");
@@ -2039,7 +2056,7 @@ static int detect_iso_kernel(const wchar_t *iso_path,
         }
 
         if (!found) {
-            asb_log(L"detect_iso_kernel: no kernel headers/image deb with -generic_ found");
+            asb_log(L"detect_iso_kernel: no kernel headers/image deb found");
             goto cleanup;
         }
     }
@@ -2827,9 +2844,20 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                 return E_INVALIDARG;
             }
             wcscpy_s(base_dir, MAX_PATH, cfg.vhdx_base_dir);
+            /* Strip trailing backslash to avoid double-backslash in paths */
+            {
+                size_t bl = wcslen(base_dir);
+                while (bl > 1 && base_dir[bl - 1] == L'\\') base_dir[--bl] = L'\0';
+            }
             /* Recursively create the base directory (handles nested paths
                like D:\VMs\AppSandbox where D:\VMs doesn't exist yet). */
-            SHCreateDirectoryExW(NULL, base_dir, NULL);
+            {
+                DWORD dr = SHCreateDirectoryExW(NULL, base_dir, NULL);
+                if (dr != ERROR_SUCCESS && dr != ERROR_ALREADY_EXISTS) {
+                    asb_log(L"Error: Cannot create storage directory (0x%lx): %s", dr, base_dir);
+                    return E_INVALIDARG;
+                }
+            }
 
             if (is_template_create) {
                 swprintf_s(vhdx_dir, MAX_PATH, L"%s\\templates\\%s", base_dir, cfg.name);
@@ -2851,7 +2879,15 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             }
         }
     }
-    CreateDirectoryW(vhdx_dir, NULL);
+    /* Use SHCreateDirectoryExW for the final VM dir to recursively create
+       any missing intermediate dirs (e.g. templates\ under custom paths). */
+    {
+        DWORD dr = SHCreateDirectoryExW(NULL, vhdx_dir, NULL);
+        if (dr != ERROR_SUCCESS && dr != ERROR_ALREADY_EXISTS) {
+            asb_log(L"Error: Cannot create VM directory (0x%lx): %s", dr, vhdx_dir);
+            return E_INVALIDARG;
+        }
+    }
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
 
     /* GPU driver shares */
