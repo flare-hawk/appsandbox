@@ -2120,21 +2120,79 @@ static int spawn_iso_patch_prefetch(const wchar_t *args)
     swprintf_s(cmdline, 2048,
         L"\"%s\\iso-patch.exe\" %s", exe_dir, args);
 
+    /* Create a pipe to capture iso-patch.exe stdout+stderr */
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hReadPipe = NULL, hWritePipe = NULL;
+    CreatePipe(&hReadPipe, &hWritePipe, &sa, 0);
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
-    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
     si.wShowWindow = SW_HIDE;
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.hStdInput = NULL;
+
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         asb_log(L"prefetch: CreateProcess failed (%lu) for: %s",
                 GetLastError(), cmdline);
+        if (hReadPipe) CloseHandle(hReadPipe);
+        if (hWritePipe) CloseHandle(hWritePipe);
         return -1;
     }
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(hWritePipe);  /* parent doesn't need the write end */
+
+    /* Read iso-patch.exe output line by line, forward to asb_log */
+    char buf[4096];
+    DWORD total = 0;
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) {
+            /* Check if process exited */
+            if (WaitForSingleObject(pi.hProcess, 100) != WAIT_TIMEOUT)
+                break;
+            continue;
+        }
+        DWORD n = avail > sizeof(buf) - 1 ? sizeof(buf) - 1 : avail;
+        DWORD rd = 0;
+        if (!ReadFile(hReadPipe, buf, n, &rd, NULL) || rd == 0)
+            break;
+        buf[rd] = 0;
+        /* Forward to asb_log (strip trailing newline) */
+        {
+            char *p = buf;
+            char *line_end;
+            while (*p) {
+                line_end = strchr(p, '\n');
+                if (line_end) *line_end = 0;
+                if (*p) asb_log(L"  %hs", p);
+                if (!line_end) break;
+                p = line_end + 1;
+            }
+        }
+        total += rd;
+    }
+
+    /* Drain any remaining output */
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0)
+            break;
+        DWORD n = avail > sizeof(buf) - 1 ? sizeof(buf) - 1 : avail;
+        DWORD rd = 0;
+        if (!ReadFile(hReadPipe, buf, n, &rd, NULL) || rd == 0)
+            break;
+        buf[rd] = 0;
+        { char *p = buf, *le; while (*p) { le = strchr(p, '\n'); if (le) *le = 0; if (*p) asb_log(L"  %hs", p); if (!le) break; p = le + 1; } }
+    }
+
     DWORD ec = 1;
     GetExitCodeProcess(pi.hProcess, &ec);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    CloseHandle(hReadPipe);
     return ec == 0 ? 0 : -1;
 }
 
@@ -2339,8 +2397,12 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         swprintf_s(args_buf, 2048,
             L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
             extras);
-        if (spawn_iso_patch_prefetch(args_buf) != 0)
-            asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
+        if (spawn_iso_patch_prefetch(args_buf) != 0) {
+            asb_log(L"Error: prefetch-repo failed — agent source missing, VM would be unusable.");
+            swprintf_s(args->error_msg, 512, L"prefetch-repo failed (GitHub download error)");
+            args->result = E_FAIL;
+            goto done;
+        }
 
         /* Prefetch 2: apt build-deps closure from archive.ubuntu.com.
            Needs (codename, kernel) detected from the ISO. */
@@ -2355,8 +2417,12 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                 L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
                 L"--out-dir \"%s\"",
                 codename, kver, apt_out);
-            if (spawn_iso_patch_prefetch(args_buf) != 0)
-                asb_log(L"WARN: prefetch-build-deps failed");
+            if (spawn_iso_patch_prefetch(args_buf) != 0) {
+                asb_log(L"Error: prefetch-build-deps failed — build tools missing, agent cannot be compiled.");
+                swprintf_s(args->error_msg, 512, L"prefetch-build-deps failed (archive.ubuntu.com SHA256 mismatch or network error)");
+                args->result = E_FAIL;
+                goto done;
+            }
         } else {
             asb_log(L"WARN: could not detect ISO kernel — skipping build-deps");
         }
