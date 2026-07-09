@@ -1814,11 +1814,16 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
         if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) &&
             dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0 && dm.dmDisplayFrequency > 1) {
             char disp_cfg[32];
+            unsigned long freq = dm.dmDisplayFrequency;
+            /* Cap at 144Hz: higher rates saturate the Hyper-V socket transport
+             * (2560x1600x4x240 ~ 3.9 GB/s raw bandwidth). 144Hz is a good
+             * balance between smoothness and bandwidth. */
+            if (freq > 144) freq = 144;
             int dl = _snprintf_s(disp_cfg, sizeof(disp_cfg), _TRUNCATE,
                                  "%lux%lux%lu",
                                  (unsigned long)dm.dmPelsWidth,
                                  (unsigned long)dm.dmPelsHeight,
-                                 (unsigned long)dm.dmDisplayFrequency);
+                                 freq);
             if (dl > 0) {
                 n += stage_marker_file(f, staging, L"display-config.marker",
                                        disp_cfg, (size_t)dl,

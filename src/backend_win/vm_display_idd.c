@@ -2459,7 +2459,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
         ZeroMemory(&dm, sizeof(dm));
         dm.dmSize = sizeof(dm);
         if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
-            d->target_refresh = dm.dmDisplayFrequency;
+            d->target_refresh = (dm.dmDisplayFrequency > 144) ? 144 : dm.dmDisplayFrequency;
         else
             d->target_refresh = 60;
     }

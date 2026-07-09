@@ -138,7 +138,7 @@ void asb_build_edid(struct asb_device *asb)
 	e[95] = 24;        /* min vertical Hz */
 	e[96] = (asb->refresh > 75) ? asb->refresh : 75;  /* max vertical Hz */
 	e[97] = 30;        /* min horizontal kHz */
-	e[98] = 150;       /* max horizontal kHz */
+	e[98] = (asb->refresh > 60) ? 255 : 150;       /* max horizontal kHz (255 covers all <=144Hz cases) */
 	e[99] = 220;       /* max pixel clock / 10 MHz -> 2200 MHz cap */
 	e[100] = 0x0a;
 	for (i = 101; i <= 107; i++) e[i] = 0x20;
