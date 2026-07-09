@@ -103,7 +103,7 @@ typedef struct AudioFrameHeader {
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+#define MAX_FRAME_DATA_SIZE (7680 * 4320 * 4)  /* max supported resolution BGRA */
 
 /* ---- Input protocol (host → guest) ---- */
 
@@ -1934,11 +1934,11 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
-    /* Compute outer window size so the client area is exactly 1920x1080 */
+    /* Compute outer window size so the client area is exactly DEFAULT_WIDTH x DEFAULT_HEIGHT */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
         DWORD exstyle = 0;
-        RECT wr = { 0, 0, 1920, 1080 };
+        RECT wr = { 0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT };
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
 
         d->hwnd = CreateWindowExW(
