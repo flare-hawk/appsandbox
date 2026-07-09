@@ -26,6 +26,7 @@
 #include <stdarg.h>
 #include <virtdisk.h>
 #pragma comment(lib, "virtdisk.lib")
+#pragma comment(lib, "shell32.lib")
 
 /* ---- DLL module handle (for locating iso-patch.exe, resources, etc.) ---- */
 
@@ -2817,17 +2818,20 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     {
         wchar_t base_dir[MAX_PATH];
         if (cfg.vhdx_base_dir[0] != L'\0') {
-            /* User-specified storage path: create it as the VM root
-               directly (no \AppSandbox suffix). */
+            /* User-specified storage path. Validate length: the final
+               vhdx_path = base + \name + \disk.vhdx must fit MAX_PATH. */
+            size_t base_len = wcslen(cfg.vhdx_base_dir);
+            size_t name_len = wcslen(cfg.name);
+            if (base_len + name_len + 32 > MAX_PATH) {
+                asb_log(L"Error: Storage path too long (%zu chars + VM name).", base_len);
+                return E_INVALIDARG;
+            }
             wcscpy_s(base_dir, MAX_PATH, cfg.vhdx_base_dir);
-            /* Ensure the base directory exists */
-            CreateDirectoryW(base_dir, NULL);
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s", base_dir);
-            CreateDirectoryW(vhdx_dir, NULL);
+            /* Recursively create the base directory (handles nested paths
+               like D:\VMs\AppSandbox where D:\VMs doesn't exist yet). */
+            SHCreateDirectoryExW(NULL, base_dir, NULL);
 
             if (is_template_create) {
-                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\templates", base_dir);
-                CreateDirectoryW(vhdx_dir, NULL);
                 swprintf_s(vhdx_dir, MAX_PATH, L"%s\\templates\\%s", base_dir, cfg.name);
             } else {
                 swprintf_s(vhdx_dir, MAX_PATH, L"%s\\%s", base_dir, cfg.name);

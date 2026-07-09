@@ -45,7 +45,6 @@ typedef struct CoreVmConfig {
     const char *username;
     const char *password;
     int         is_template;
-    const char *storage_path;   /* custom VM storage directory, or NULL for default */
 } CoreVmConfig;
 
 /* ---- VM snapshot state (outputs from list_vms) ---- */

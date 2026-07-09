@@ -1284,7 +1284,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
         (d->frame_width != d->frame_tex_width || d->frame_height != d->frame_tex_height)) {
         d3d_recreate_frame_texture(d, d->frame_width, d->frame_height);
     }
-    if (d->frame_dirty) {
+    if (d->frame_dirty && d->frame_tex) {
         EnterCriticalSection(&d->frame_cs);
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
