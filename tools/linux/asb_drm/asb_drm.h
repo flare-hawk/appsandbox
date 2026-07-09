@@ -59,6 +59,10 @@ struct asb_device {
 	struct drm_plane        primary_plane;
 	struct drm_plane        cursor_plane;
 
+	/* Hotplug mode update property — tells the compositor to switch modes
+	 * when a hotplug event fires (same pattern as virtio-gpu/QXL). */
+	struct drm_property      *hotplug_mode_update_prop;
+
 	/* Active mode at probe time; module params seed this. */
 	unsigned int            width;
 	unsigned int            height;

@@ -272,6 +272,10 @@ struct VmDisplayIdd {
     HANDLE           audio_recv_thread;
     volatile BOOL    audio_muted;
 
+    /* Dynamic resolution: suppresses auto-resize while waiting for guest
+     * to acknowledge a host-initiated resolution change. */
+    volatile BOOL    resolution_pending;
+
     /* Threads */
     HANDLE         recv_thread;
     HANDLE         window_thread;
@@ -1279,23 +1283,27 @@ static void d3d_render_frame(VmDisplayIdd *d)
     if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
         return;
 
-    /* Upload frame data to GPU texture if dirty */
-    /* Recreate GPU texture if the guest resolution changed since last frame */
+    /* If guest resolution changed, recreate GPU texture AND resize window.
+     * Both must happen in the same block — checking after texture recreation
+     * would miss the change (frame_tex_width is updated by recreate). */
     if (d->frame_dirty && d->device &&
         (d->frame_width != d->frame_tex_width || d->frame_height != d->frame_tex_height)) {
         d3d_recreate_frame_texture(d, d->frame_width, d->frame_height);
-    }
-    /* Auto-resize window to match guest resolution on first frame or
-     * resolution change. This runs on the window thread (via timer/MSG). */
-    if (d->frame_dirty && d->hwnd &&
-        (d->frame_width != d->frame_tex_width || d->frame_height != d->frame_tex_height)) {
-        DWORD style = (DWORD)GetWindowLongW(d->hwnd, GWL_STYLE);
-        DWORD exstyle = (DWORD)GetWindowLongW(d->hwnd, GWL_EXSTYLE);
-        RECT wr = { 0, 0, (LONG)d->frame_width, (LONG)d->frame_height };
-        AdjustWindowRectEx(&wr, style, FALSE, exstyle);
-        SetWindowPos(d->hwnd, NULL, 0, 0,
-                     wr.right - wr.left, wr.bottom - wr.top,
-                     SWP_NOMOVE | SWP_NOZORDER);
+
+        /* Auto-resize window to match guest resolution — but only if the
+         * resize wasn't host-initiated (resolution_pending suppresses this
+         * to avoid a feedback loop while waiting for the guest to ack). */
+        if (d->hwnd && !d->resolution_pending) {
+            DWORD style = (DWORD)GetWindowLongW(d->hwnd, GWL_STYLE);
+            DWORD exstyle = (DWORD)GetWindowLongW(d->hwnd, GWL_EXSTYLE);
+            RECT wr = { 0, 0, (LONG)d->frame_width, (LONG)d->frame_height };
+            AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+            SetWindowPos(d->hwnd, NULL, 0, 0,
+                         wr.right - wr.left, wr.bottom - wr.top,
+                         SWP_NOMOVE | SWP_NOZORDER);
+        }
+        /* Guest acknowledged the resolution change — clear pending flag */
+        d->resolution_pending = FALSE;
     }
     if (d->frame_dirty && d->frame_tex) {
         EnterCriticalSection(&d->frame_cs);
@@ -1957,10 +1965,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     /* Compute outer window size so the client area is exactly DEFAULT_WIDTH x DEFAULT_HEIGHT */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
-        /* Remove resize border and maximize button: window is fixed-size.
-           It auto-resizes to match the guest's actual resolution when the
-           first frame arrives (see WM_IDD_FRAME_READY below). */
-        style &= ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+        /* Window is resizable: user can resize/maximize and the guest
+         * resolution will follow via WM_EXITSIZEMOVE -> set_resolution. */
         DWORD exstyle = 0;
         RECT wr = { 0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT };
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
@@ -2246,14 +2252,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
-        /* Max: native frame size */
-        if (d && d->frame_width > 0 && d->frame_height > 0) {
-            wr.left = 0; wr.top = 0;
-            wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
-            AdjustWindowRectEx(&wr, style, FALSE, exstyle);
-            mmi->ptMaxTrackSize.x = wr.right - wr.left;
-            mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
-        }
+        /* No max track size restriction — user can resize freely.
+         * Guest resolution follows via WM_EXITSIZEMOVE. */
         return 0;
     }
 
@@ -2275,6 +2275,29 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         EndPaint(hwnd, &ps);
         return 0;
     }
+
+    case WM_EXITSIZEMOVE:
+        /* User finished resizing or maximizing. Send the new client-area
+         * dimensions to the guest so it can switch its display resolution
+         * to match. The guest agent writes to asb_drm's sysfs, which fires
+         * a hotplug event, and Mutter switches to the new preferred mode. */
+        if (d && d->vm) {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            if (rc.right > 0 && rc.bottom > 0) {
+                char cmd[64];
+                int n = _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+                                    "set_resolution:%ux%u",
+                                    (unsigned)rc.right, (unsigned)rc.bottom);
+                if (n > 0) {
+                    d->resolution_pending = TRUE;
+                    vm_agent_send(d->vm, cmd, NULL, 0, 5000);
+                    idd_log(d, L"WM_EXITSIZEMOVE: requested guest resolution %ux%u",
+                            (unsigned)rc.right, (unsigned)rc.bottom);
+                }
+            }
+        }
+        return 0;
 
     case WM_TIMER:
         if (wp == IDT_PRESENT && d) {

@@ -125,6 +125,33 @@ static int asb_mode_config_setup(struct asb_device *asb)
  * platform_driver — probe / remove
  * -------------------------------------------------------------------------- */
 
+/* ---- Sysfs: dynamic resolution change ----
+ *
+ * Writing "WxH" or "WxH@R" to /sys/devices/platform/asb_drm.0/resolution
+ * updates the virtual display dimensions, rebuilds the EDID, and fires
+ * a DRM hotplug event. The compositor (Mutter) sees the hotplug, checks
+ * the hotplug_mode_update property, reprobes the connector, and switches
+ * to the new preferred mode. This is the same pattern as virtio-gpu. */
+static ssize_t resolution_store(struct device *dev,
+                                struct device_attribute *attr,
+                                const char *buf, size_t count)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+	struct asb_device *asb = to_asb(drm);
+	unsigned int w = 0, h = 0, r = asb->refresh;
+	if (sscanf(buf, "%ux%u@%u", &w, &h, &r) < 2 &&
+	    sscanf(buf, "%ux%u", &w, &h) < 2)
+		return -EINVAL;
+	if (w < 64 || h < 64) return -EINVAL;
+	asb->width   = clamp(w, 64u, (unsigned)ASB_MAX_WIDTH);
+	asb->height  = clamp(h, 64u, (unsigned)ASB_MAX_HEIGHT);
+	asb->refresh = clamp(r, 24u, 240u);
+	asb_build_edid(asb);
+	drm_kms_helper_hotplug_event(drm);
+	return count;
+}
+static DEVICE_ATTR_WO(resolution);
+
 static int asb_probe(struct platform_device *pdev)
 {
 	struct asb_device *asb;
@@ -194,6 +221,8 @@ static int asb_probe(struct platform_device *pdev)
 
 	dev_info(&pdev->dev, "AppSandbox virtual display ready: %ux%u@%uHz\n",
 	         asb->width, asb->height, asb->refresh);
+
+	device_create_file(&pdev->dev, &dev_attr_resolution);
 	return 0;
 }
 
@@ -202,6 +231,7 @@ static void asb_remove(struct platform_device *pdev)
 	struct drm_device *drm = platform_get_drvdata(pdev);
 	struct asb_device *asb = to_asb(drm);
 
+	device_remove_file(&pdev->dev, &dev_attr_resolution);
 	drm_dev_unplug(drm);
 	asb_mode_fini(asb);
 	drm_atomic_helper_shutdown(drm);

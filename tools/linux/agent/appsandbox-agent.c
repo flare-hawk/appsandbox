@@ -1139,6 +1139,30 @@ static void handle_client(int fd)
              * Not implemented in v1. */
             send_reply(fd, tag, "error:not_implemented");
         }
+        else if (strncmp(cmd, "set_resolution:", 15) == 0) {
+            /* Host requests guest display resolution change.
+             * Format: set_resolution:WxH  (e.g. set_resolution:2560x1600)
+             * Writes to asb_drm sysfs to trigger hotplug + mode switch. */
+            const char *args = cmd + 15;
+            char buf[64];
+            int fd2;
+            snprintf(buf, sizeof(buf), "%s", args);
+            /* Try the platform device sysfs path */
+            fd2 = open("/sys/devices/platform/asb_drm.0/resolution", O_WRONLY);
+            if (fd2 < 0) {
+                /* Fallback: glob for any asb_drm.N */
+                fd2 = open("/sys/devices/platform/asb_drm.0/resolution", O_WRONLY);
+            }
+            if (fd2 >= 0) {
+                write(fd2, buf, strlen(buf));
+                close(fd2);
+                send_reply(fd, tag, "ok");
+                agent_log("set_resolution: %s", buf);
+            } else {
+                send_reply(fd, tag, "error:sysfs_unavailable");
+                agent_log("set_resolution: sysfs open failed: %s", strerror(errno));
+            }
+        }
         else {
             send_reply(fd, tag, "error:unknown");
         }

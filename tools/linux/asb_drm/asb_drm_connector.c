@@ -237,6 +237,17 @@ int asb_connector_init(struct asb_device *asb)
 		return ret;
 	drm_connector_helper_add(&asb->connector, &asb_connector_helper_funcs);
 
+	/* hotplug_mode_update property: tells Mutter/Weston to switch to the
+	 * new preferred mode when a hotplug event fires (same pattern as
+	 * virtio-gpu and QXL). Without this, the compositor refreshes the
+	 * mode list but does NOT switch the active mode. */
+	asb->hotplug_mode_update_prop =
+		drm_property_create_range(drm, DRM_MODE_PROP_IMMUTABLE,
+		                          "hotplug_mode_update", 0, 1);
+	if (asb->hotplug_mode_update_prop)
+		drm_object_attach_property(&asb->connector.base,
+		                           asb->hotplug_mode_update_prop, 1);
+
 	/* "Connected" forever — we're virtual, no hot-plug events. */
 	asb->connector.status = connector_status_connected;
 	asb->connector.interlace_allowed = false;
