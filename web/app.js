@@ -143,6 +143,8 @@ window.onHostMessage = function(msg) {
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
         case 'browseStorageResult': onBrowseStorageResult(msg.path); break;
+        case 'exportResult':  if (msg.result === 'ok') logMsg('VM exported successfully.'); else logMsg('Export failed.'); break;
+        case 'importResult':  if (msg.result === 'ok') logMsg('VM imported successfully.'); else logMsg('Import failed.'); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
@@ -626,6 +628,14 @@ function closeCreateModal() {
     document.getElementById('create-vm-overlay').classList.remove('active');
 }
 
+function onImportVm() {
+    sendCmd('importVm', {});
+}
+
+function onExportVm(vmIndex) {
+    sendCmd('exportVm', { vmIndex: vmIndex });
+}
+
 /* Close on backdrop click — but only when the press also STARTED on the backdrop.
    A click targets the common ancestor of the mousedown and mouseup, so pressing
    inside the modal (e.g. selecting text in a field) and releasing on the backdrop
@@ -784,6 +794,7 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
+        makeIconCell('export', '\uD83D\uDCE4', !vm.running && !bld, function() { onExportVm(i); }, '', 'Export this VM to a folder (copy VHDX + snapshots)'),
         makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'),
     );
     return cells;

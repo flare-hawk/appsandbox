@@ -16,6 +16,7 @@
     <div class="section-header">
         <h2>Sandboxes</h2>
         <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+        <button id="btn-import-sandbox" onclick="onImportVm()">Import</button>
     </div>
     <div class="vm-table-wrap">
         <table id="vm-table">
@@ -36,6 +37,7 @@
                 <th class="icon-col">&#x23FB;</th>
                 <th class="icon-col">&#x2715;&#xFE0F;</th>
                 <th class="icon-col">&#x1F5D1;&#xFE0F;</th>
+                <th class="icon-col" title="Export">&#x1F4E4;</th>
                 <th class="icon-col">&#x270F;&#xFE0F;</th>
             </tr></thead>
             <tbody id="vm-tbody"></tbody>

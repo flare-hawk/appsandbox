@@ -691,6 +691,24 @@ static int handle_request(PHTTP_REQUEST req)
         }
     }
 
+    /* ---- /v1/vms/import (POST) ---- */
+    if (verb == HttpVerbPOST && wcscmp(path, L"/v1/vms/import") == 0) {
+        wchar_t body[4096];
+        wchar_t vhdx_path[MAX_PATH]={0}, vm_name[256]={0}, os_type[32]={0}, storage[MAX_PATH]={0};
+        body_to_wide(req, body, 4096);
+        json_get_string(body, L"vhdxPath", vhdx_path, MAX_PATH);
+        json_get_string(body, L"name", vm_name, 256);
+        json_get_string(body, L"osType", os_type, 32);
+        json_get_string(body, L"storagePath", storage, MAX_PATH);
+        {
+            HRESULT hr = asb_vm_import(vhdx_path, vm_name,
+                                        os_type[0] ? os_type : NULL,
+                                        storage[0] ? storage : NULL);
+            send_hr(req->RequestId, "importVm", "", hr);
+        }
+        return 0;
+    }
+
     /* ---- /v1/vms/{name}[/sub] ---- */
     if (wcsncmp(path, L"/v1/vms/", 8) == 0) {
         const wchar_t *rest = path + 8;
@@ -798,6 +816,13 @@ static int handle_request(PHTTP_REQUEST req)
             }
             if (dv) display_drop(display_find(dv->unique_id));   /* close its display window first */
             send_hr(req->RequestId, "delete", nu, asb_vm_delete(vm));
+            return 0;
+        }
+        if (verb == HttpVerbPOST && wcscmp(sub, L"export") == 0) {
+            wchar_t body[1024], target_dir[MAX_PATH] = {0};
+            body_to_wide(req, body, 1024);
+            json_get_string(body, L"targetDir", target_dir, MAX_PATH);
+            send_hr(req->RequestId, "export", nu, asb_vm_export(vm, target_dir));
             return 0;
         }
 

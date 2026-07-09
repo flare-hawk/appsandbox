@@ -734,6 +734,33 @@ static void remove_dir_recursive(const wchar_t *dir)
     RemoveDirectoryW(dir);
 }
 
+/* ---- Utility: recursive directory copy ---- */
+
+static BOOL copy_dir_recursive(const wchar_t *src, const wchar_t *dst)
+{
+    wchar_t src_pattern[MAX_PATH], src_full[MAX_PATH], dst_full[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+
+    CreateDirectoryW(dst, NULL);
+    swprintf_s(src_pattern, MAX_PATH, L"%s\\*", src);
+    h = FindFirstFileW(src_pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == L'\0' ||
+            (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
+            continue;
+        swprintf_s(src_full, MAX_PATH, L"%s\\%s", src, fd.cFileName);
+        swprintf_s(dst_full, MAX_PATH, L"%s\\%s", dst, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            copy_dir_recursive(src_full, dst_full);
+        else
+            CopyFileW(src_full, dst_full, FALSE);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return TRUE;
+}
+
 /* ---- HCS state callback (called from HCS worker thread) ---- */
 
 static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
@@ -3413,6 +3440,202 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     LeaveCriticalSection(&g_cs);
 
     save_vm_list();
+    return S_OK;
+}
+
+/* ---- VM import / export ---- */
+
+ASB_API HRESULT asb_vm_export(AsbVm vm, const wchar_t *target_dir)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    VmInstance *inst = &g_vms[idx];
+
+    if (inst->running) {
+        asb_log(L"Export error: VM \"%s\" is running. Stop it first.", inst->name);
+        return HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
+    }
+    if (!target_dir || !target_dir[0]) return E_INVALIDARG;
+
+    /* Create target_dir\<vm_name> */
+    wchar_t export_dir[MAX_PATH];
+    swprintf_s(export_dir, MAX_PATH, L"%s\\%s", target_dir, inst->name);
+    SHCreateDirectoryExW(NULL, export_dir, NULL);
+
+    /* Copy disk.vhdx */
+    wchar_t src_vhdx[MAX_PATH], dst_vhdx[MAX_PATH];
+    wcscpy_s(src_vhdx, MAX_PATH, inst->vhdx_path);
+    swprintf_s(dst_vhdx, MAX_PATH, L"%s\\disk.vhdx", export_dir);
+    asb_log(L"Export: copying %s -> %s ...", src_vhdx, dst_vhdx);
+    if (!CopyFileW(src_vhdx, dst_vhdx, FALSE)) {
+        asb_log(L"Export error: CopyFileW failed (%lu)", GetLastError());
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    /* Copy snapshots directory if it exists */
+    {
+        wchar_t snap_dir[MAX_PATH];
+        wcscpy_s(snap_dir, MAX_PATH, inst->vhdx_path);
+        wchar_t *slash = wcsrchr(snap_dir, L'\\');
+        if (slash) *slash = L'\0';
+        swprintf_s(snap_dir + wcslen(snap_dir), MAX_PATH - wcslen(snap_dir),
+                    L"\\snapshots");
+        if (GetFileAttributesW(snap_dir) != INVALID_FILE_ATTRIBUTES) {
+            wchar_t dst_snap[MAX_PATH];
+            swprintf_s(dst_snap, MAX_PATH, L"%s\\snapshots", export_dir);
+            asb_log(L"Export: copying snapshots ...");
+            copy_dir_recursive(snap_dir, dst_snap);
+        }
+    }
+
+    /* Copy state files */
+    {
+        wchar_t dir[MAX_PATH];
+        wcscpy_s(dir, MAX_PATH, inst->vhdx_path);
+        wchar_t *slash = wcsrchr(dir, L'\\');
+        if (slash) *slash = L'\0';
+
+        wchar_t src_file[MAX_PATH], dst_file[MAX_PATH];
+        const wchar_t *files[] = { L"vm_state.json", L"language.json", NULL };
+        for (int i = 0; files[i]; i++) {
+            swprintf_s(src_file, MAX_PATH, L"%s\\%s", dir, files[i]);
+            if (GetFileAttributesW(src_file) != INVALID_FILE_ATTRIBUTES) {
+                swprintf_s(dst_file, MAX_PATH, L"%s\\%s", export_dir, files[i]);
+                CopyFileW(src_file, dst_file, FALSE);
+            }
+        }
+    }
+
+    asb_log(L"Export complete: %s", export_dir);
+    return S_OK;
+}
+
+ASB_API HRESULT asb_vm_import(const wchar_t *source_vhdx,
+                               const wchar_t *vm_name,
+                               const wchar_t *os_type,
+                               const wchar_t *storage_path)
+{
+    wchar_t vhdx_dir[MAX_PATH], base_dir[MAX_PATH];
+    VmInstance *inst;
+    int i;
+
+    if (!source_vhdx || !vm_name || !vm_name[0])
+        return E_INVALIDARG;
+    if (GetFileAttributesW(source_vhdx) == INVALID_FILE_ATTRIBUTES) {
+        asb_log(L"Import error: source VHDX not found: %s", source_vhdx);
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
+
+    /* Check duplicate name */
+    for (i = 0; i < g_vm_count; i++) {
+        if (_wcsicmp(g_vms[i].name, vm_name) == 0) {
+            asb_log(L"Import error: VM \"%s\" already exists.", vm_name);
+            return E_INVALIDARG;
+        }
+    }
+    if (g_vm_count >= ASB_MAX_VMS) return E_OUTOFMEMORY;
+
+    /* Determine storage path */
+    if (storage_path && storage_path[0] != L'\0') {
+        size_t bl = wcslen(storage_path);
+        while (bl > 1 && storage_path[bl-1] == L'\\') bl--;
+        if (bl + wcslen(vm_name) + 64 > MAX_PATH) {
+            asb_log(L"Import error: storage path too long.");
+            return E_INVALIDARG;
+        }
+        wcsncpy_s(base_dir, MAX_PATH, storage_path, _TRUNCATE);
+        if (bl < wcslen(storage_path)) base_dir[bl] = L'\0';
+    } else {
+        if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
+            wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
+    }
+
+    SHCreateDirectoryExW(NULL, base_dir, NULL);
+    swprintf_s(vhdx_dir, MAX_PATH, L"%s\\%s", base_dir, vm_name);
+    {
+        DWORD dr = SHCreateDirectoryExW(NULL, vhdx_dir, NULL);
+        if (dr != ERROR_SUCCESS && dr != ERROR_ALREADY_EXISTS) {
+            asb_log(L"Import error: cannot create VM directory (0x%lx)", dr);
+            return E_INVALIDARG;
+        }
+    }
+
+    /* Copy the VHDX */
+    wchar_t dst_vhdx[MAX_PATH];
+    swprintf_s(dst_vhdx, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
+    asb_log(L"Import: copying %s -> %s ...", source_vhdx, dst_vhdx);
+    if (!CopyFileW(source_vhdx, dst_vhdx, FALSE)) {
+        asb_log(L"Import error: CopyFileW failed (%lu)", GetLastError());
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    /* Copy snapshots directory if it exists alongside the source */
+    {
+        wchar_t src_dir[MAX_PATH], snap_dir[MAX_PATH];
+        wcscpy_s(src_dir, MAX_PATH, source_vhdx);
+        wchar_t *slash = wcsrchr(src_dir, L'\\');
+        if (slash) *slash = L'\0';
+        swprintf_s(snap_dir, MAX_PATH, L"%s\\snapshots", src_dir);
+        if (GetFileAttributesW(snap_dir) != INVALID_FILE_ATTRIBUTES) {
+            wchar_t dst_snap[MAX_PATH];
+            swprintf_s(dst_snap, MAX_PATH, L"%s\\snapshots", vhdx_dir);
+            asb_log(L"Import: copying snapshots ...");
+            copy_dir_recursive(snap_dir, dst_snap);
+        }
+    }
+
+    /* Register the VM */
+    inst = &g_vms[g_vm_count];
+    ZeroMemory(inst, sizeof(VmInstance));
+    inst->unique_id = g_next_vm_id++;
+    wcscpy_s(inst->name, 256, vm_name);
+    wcscpy_s(inst->vhdx_path, MAX_PATH, dst_vhdx);
+
+    /* OS type: auto-detect from state file or default to Windows */
+    if (os_type && os_type[0])
+        wcscpy_s(inst->os_type, 32, os_type);
+    else {
+        wchar_t state_path[MAX_PATH];
+        swprintf_s(state_path, MAX_PATH, L"%s\\vm_state.json", vhdx_dir);
+        FILE *f = NULL;
+        if (_wfopen_s(&f, state_path, L"r") == 0 && f) {
+            char buf[256];
+            if (fgets(buf, sizeof(buf), f)) {
+                if (strstr(buf, "\"os_type\":\"Linux\"") ||
+                    strstr(buf, "\"osType\":\"Linux\""))
+                    wcscpy_s(inst->os_type, 32, L"Linux");
+                else
+                    wcscpy_s(inst->os_type, 32, L"Windows");
+            } else {
+                wcscpy_s(inst->os_type, 32, L"Windows");
+            }
+            fclose(f);
+        } else {
+            wcscpy_s(inst->os_type, 32, L"Windows");
+        }
+    }
+
+    /* Defaults for imported VM */
+    inst->ram_mb = 4096;
+    inst->hdd_gb = 64;
+    inst->cpu_cores = 4;
+    inst->gpu_mode = 0;
+    inst->network_mode = 1; /* NAT */
+    inst->test_mode = FALSE;
+    inst->install_complete = vm_load_state_json(dst_vhdx);
+
+    /* Initialize snapshot tree */
+    {
+        wchar_t snap_dir[MAX_PATH];
+        swprintf_s(snap_dir, MAX_PATH, L"%s\\snapshots", vhdx_dir);
+        snapshot_init(&g_snap_trees[g_vm_count], snap_dir);
+    }
+
+    g_vm_count++;
+    save_vm_list();
+
+    asb_log(L"Import complete: VM \"%s\" (os=%s, vhdx=%s)",
+            vm_name, inst->os_type, dst_vhdx);
     return S_OK;
 }
 
