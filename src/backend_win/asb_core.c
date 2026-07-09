@@ -2413,13 +2413,41 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                               kver,     ARRAYSIZE(kver)) == 0) {
             wchar_t apt_out[MAX_PATH];
             swprintf_s(apt_out, MAX_PATH, L"%s\\local-apt-extras", extras);
-            swprintf_s(args_buf, 2048,
-                L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
-                L"--out-dir \"%s\"",
-                codename, kver, apt_out);
-            if (spawn_iso_patch_prefetch(args_buf) != 0) {
-                asb_log(L"Error: prefetch-build-deps failed — build tools missing, agent cannot be compiled.");
-                swprintf_s(args->error_msg, 512, L"prefetch-build-deps failed (archive.ubuntu.com SHA256 mismatch or network error)");
+            /* Try primary mirror first, then fallback mirrors */
+            const wchar_t *mirrors[] = {
+                NULL,  /* NULL = default (archive.ubuntu.com) */
+                L"http://mirrors.kernel.org/ubuntu",
+                L"http://us.archive.ubuntu.com/ubuntu",
+                NULL
+            };
+            BOOL build_deps_ok = FALSE;
+            int mi;
+            for (mi = 0; mirrors[mi] != NULL || mi == 0; mi++) {
+                if (mi > 0 && !mirrors[mi]) break;
+                if (mirrors[mi])
+                    asb_log(L"prefetch-build-deps: trying mirror %ls", mirrors[mi]);
+                if (mirrors[mi])
+                    swprintf_s(args_buf, 2048,
+                        L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
+                        L"--out-dir \"%s\" --mirror \"%s\"",
+                        codename, kver, apt_out, mirrors[mi]);
+                else
+                    swprintf_s(args_buf, 2048,
+                        L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
+                        L"--out-dir \"%s\"",
+                        codename, kver, apt_out);
+                if (spawn_iso_patch_prefetch(args_buf) == 0) {
+                    build_deps_ok = TRUE;
+                    break;
+                }
+                if (mirrors[mi])
+                    asb_log(L"prefetch-build-deps: mirror %ls failed, trying next...", mirrors[mi]);
+                else
+                    asb_log(L"prefetch-build-deps: primary mirror failed, trying fallback...");
+            }
+            if (!build_deps_ok) {
+                asb_log(L"Error: prefetch-build-deps failed on all mirrors - build tools missing.");
+                swprintf_s(args->error_msg, 512, L"prefetch-build-deps failed on all mirrors (SHA256 mismatch or network error). Retry in a few hours.");
                 args->result = E_FAIL;
                 goto done;
             }
