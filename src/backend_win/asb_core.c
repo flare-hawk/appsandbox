@@ -3506,6 +3506,30 @@ ASB_API HRESULT asb_vm_export(AsbVm vm, const wchar_t *target_dir)
         }
     }
 
+    /* Write metadata file with full VM config for cross-machine import */
+    {
+        wchar_t meta_path[MAX_PATH];
+        swprintf_s(meta_path, MAX_PATH, L"%s\\vm_export.json", export_dir);
+        FILE *mf = NULL;
+        if (_wfopen_s(&mf, meta_path, L"w") == 0 && mf) {
+            char os_utf8[32];
+            WideCharToMultiByte(CP_UTF8, 0, inst->os_type, -1, os_utf8, sizeof(os_utf8), NULL, NULL);
+            fprintf(mf, "{\"osType\":\"%s\",\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,"
+                         "\"gpuMode\":%d,\"networkMode\":%d,\"testMode\":%d,"
+                         "\"sshEnabled\":%d,\"adminUser\":\"",
+                os_utf8, inst->ram_mb, inst->hdd_gb, inst->cpu_cores,
+                inst->gpu_mode, inst->network_mode, inst->test_mode ? 1 : 0,
+                inst->ssh_enabled ? 1 : 0);
+            /* admin_user may contain non-ASCII; write as UTF-8 */
+            {
+                char user_utf8[256];
+                WideCharToMultiByte(CP_UTF8, 0, inst->admin_user, -1, user_utf8, sizeof(user_utf8), NULL, NULL);
+                fprintf(mf, "%s\"}\n", user_utf8);
+            }
+            fclose(mf);
+        }
+    }
+
     asb_log(L"Export complete: %s", export_dir);
     return S_OK;
 }
@@ -3515,7 +3539,7 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source_vhdx,
                                const wchar_t *os_type,
                                const wchar_t *storage_path)
 {
-    wchar_t vhdx_dir[MAX_PATH], base_dir[MAX_PATH];
+    wchar_t vhdx_dir[MAX_PATH], base_dir[MAX_PATH], src_dir[MAX_PATH];
     VmInstance *inst;
     int i;
 
@@ -3526,31 +3550,72 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source_vhdx,
         return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
     }
 
-    /* Check duplicate name */
+    /* Validate VM name: reject path traversal and illegal filesystem characters */
+    {
+        const wchar_t *p;
+        for (p = vm_name; *p; p++) {
+            if (*p == L'\\' || *p == L'/' || *p == L'.' && p[1] == L'.') {
+                asb_log(L"Import error: VM name contains path separator or traversal.");
+                return E_INVALIDARG;
+            }
+        }
+        if (wcslen(vm_name) > 128) {
+            asb_log(L"Import error: VM name too long (max 128 chars).");
+            return E_INVALIDARG;
+        }
+    }
+
+    /* Derive source directory from source_vhdx path */
+    wcscpy_s(src_dir, MAX_PATH, source_vhdx);
+    {
+        wchar_t *slash = wcsrchr(src_dir, L'\\');
+        if (slash) *slash = L'\0';
+    }
+
+    /* Thread-safe duplicate check and slot reservation */
+    EnterCriticalSection(&g_cs);
     for (i = 0; i < g_vm_count; i++) {
         if (_wcsicmp(g_vms[i].name, vm_name) == 0) {
+            LeaveCriticalSection(&g_cs);
             asb_log(L"Import error: VM \"%s\" already exists.", vm_name);
             return E_INVALIDARG;
         }
     }
-    if (g_vm_count >= ASB_MAX_VMS) return E_OUTOFMEMORY;
+    if (g_vm_count >= ASB_MAX_VMS) {
+        LeaveCriticalSection(&g_cs);
+        return E_OUTOFMEMORY;
+    }
+    /* Reserve the slot */
+    inst = &g_vms[g_vm_count];
+    ZeroMemory(inst, sizeof(VmInstance));
+    LeaveCriticalSection(&g_cs);
 
     /* Determine storage path */
     if (storage_path && storage_path[0] != L'\0') {
         size_t bl = wcslen(storage_path);
-        while (bl > 1 && storage_path[bl-1] == L'\\') bl--;
+        while (bl > 3 && storage_path[bl-1] == L'\\') bl--;
         if (bl + wcslen(vm_name) + 64 > MAX_PATH) {
             asb_log(L"Import error: storage path too long.");
             return E_INVALIDARG;
         }
         wcsncpy_s(base_dir, MAX_PATH, storage_path, _TRUNCATE);
-        if (bl < wcslen(storage_path)) base_dir[bl] = L'\0';
+        base_dir[bl] = L'\0';
     } else {
         if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
             wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
+        /* Append \AppSandbox to match the standard VM storage convention */
+        swprintf_s(base_dir + wcslen(base_dir), MAX_PATH - wcslen(base_dir),
+                    L"\\AppSandbox");
     }
 
-    SHCreateDirectoryExW(NULL, base_dir, NULL);
+    /* Create directories */
+    {
+        DWORD dr = SHCreateDirectoryExW(NULL, base_dir, NULL);
+        if (dr != ERROR_SUCCESS && dr != ERROR_ALREADY_EXISTS) {
+            asb_log(L"Import error: cannot create base directory (0x%lx)", dr);
+            return E_INVALIDARG;
+        }
+    }
     swprintf_s(vhdx_dir, MAX_PATH, L"%s\\%s", base_dir, vm_name);
     {
         DWORD dr = SHCreateDirectoryExW(NULL, vhdx_dir, NULL);
@@ -3569,59 +3634,131 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source_vhdx,
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
-    /* Copy snapshots directory if it exists alongside the source */
+    /* Copy state files (vm_state.json, language.json) from source directory */
     {
-        wchar_t src_dir[MAX_PATH], snap_dir[MAX_PATH];
-        wcscpy_s(src_dir, MAX_PATH, source_vhdx);
-        wchar_t *slash = wcsrchr(src_dir, L'\\');
-        if (slash) *slash = L'\0';
-        swprintf_s(snap_dir, MAX_PATH, L"%s\\snapshots", src_dir);
-        if (GetFileAttributesW(snap_dir) != INVALID_FILE_ATTRIBUTES) {
-            wchar_t dst_snap[MAX_PATH];
-            swprintf_s(dst_snap, MAX_PATH, L"%s\\snapshots", vhdx_dir);
-            asb_log(L"Import: copying snapshots ...");
-            copy_dir_recursive(snap_dir, dst_snap);
+        const wchar_t *files[] = { L"vm_state.json", L"language.json", NULL };
+        int fi;
+        for (fi = 0; files[fi]; fi++) {
+            wchar_t src_file[MAX_PATH], dst_file[MAX_PATH];
+            swprintf_s(src_file, MAX_PATH, L"%s\\%s", src_dir, files[fi]);
+            if (GetFileAttributesW(src_file) != INVALID_FILE_ATTRIBUTES) {
+                swprintf_s(dst_file, MAX_PATH, L"%s\\%s", vhdx_dir, files[fi]);
+                CopyFileW(src_file, dst_file, FALSE);
+            }
         }
     }
 
-    /* Register the VM */
-    inst = &g_vms[g_vm_count];
-    ZeroMemory(inst, sizeof(VmInstance));
+    /* Copy snapshots directory if it exists alongside the source */
+    {
+        wchar_t snap_src[MAX_PATH], snap_dst[MAX_PATH];
+        swprintf_s(snap_src, MAX_PATH, L"%s\\snapshots", src_dir);
+        if (GetFileAttributesW(snap_src) != INVALID_FILE_ATTRIBUTES) {
+            swprintf_s(snap_dst, MAX_PATH, L"%s\\snapshots", vhdx_dir);
+            asb_log(L"Import: copying snapshots ...");
+            copy_dir_recursive(snap_src, snap_dst);
+            /* Rewrite snapshot tree paths to new location */
+            {
+                wchar_t tree_path[MAX_PATH];
+                swprintf_s(tree_path, MAX_PATH, L"%s\\tree.dat", snap_dst);
+                /* Rewrite paths in tree.dat: replace old src_dir with new vhdx_dir */
+                {
+                    FILE *tf = NULL;
+                    if (_wfopen_s(&tf, tree_path, L"r") == 0 && tf) {
+                        char line[2048];
+                        char *content = NULL;
+                        size_t content_len = 0, content_cap = 0;
+                        /* Read entire file */
+                        while (fgets(line, sizeof(line), tf)) {
+                            size_t ll = strlen(line);
+                            if (content_len + ll + 1 > content_cap) {
+                                content_cap = (content_len + ll + 1) * 2;
+                                content = (char *)realloc(content, content_cap);
+                            }
+                            memcpy(content + content_len, line, ll);
+                            content_len += ll;
+                        }
+                        fclose(tf);
+                        if (content) {
+                            content[content_len] = 0;
+                            /* Replace old src_dir paths with new vhdx_dir */
+                            {
+                                char old_path[MAX_PATH * 3];
+                                char new_path[MAX_PATH * 3];
+                                WideCharToMultiByte(CP_UTF8, 0, src_dir, -1,
+                                                    old_path, sizeof(old_path), NULL, NULL);
+                                WideCharToMultiByte(CP_UTF8, 0, vhdx_dir, -1,
+                                                    new_path, sizeof(new_path), NULL, NULL);
+                                /* Simple string replacement */
+                                char *p = content;
+                                while ((p = strstr(p, old_path)) != NULL) {
+                                    size_t old_len = strlen(old_path);
+                                    size_t new_len = strlen(new_path);
+                                    memmove(p + new_len, p + old_len,
+                                            strlen(p + old_len) + 1);
+                                    memcpy(p, new_path, new_len);
+                                    p += new_len;
+                                }
+                            }
+                            /* Write back */
+                            if (_wfopen_s(&tf, tree_path, L"w") == 0 && tf) {
+                                fwrite(content, 1, content_len, tf);
+                                fclose(tf);
+                            }
+                            free(content);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Read export metadata if available */
+    {
+        wchar_t meta_path[MAX_PATH];
+        swprintf_s(meta_path, MAX_PATH, L"%s\\vm_export.json", src_dir);
+        FILE *mf = NULL;
+        wchar_t meta_os[32] = {0};
+        int meta_ram = 0, meta_hdd = 0, meta_cpu = 0, meta_gpu = 0, meta_net = 0;
+        int meta_test = 0, meta_ssh = 0;
+        if (_wfopen_s(&mf, meta_path, L"r") == 0 && mf) {
+            char buf[1024];
+            size_t nread = fread(buf, 1, sizeof(buf) - 1, mf);
+            buf[nread] = 0;
+            fclose(mf);
+            /* Simple JSON parsing */
+            { char *p; if ((p = strstr(buf, "\"osType\":\""))) { p += 9; char *e = strchr(p, '"'); if (e) { size_t l = e - p; if (l < 32) { MultiByteToWideChar(CP_UTF8, 0, p, (int)l, meta_os, 32); meta_os[l] = 0; } } } }
+            { char *p; if ((p = strstr(buf, "\"ramMb\":"))) sscanf(p, "\"ramMb\":%d", &meta_ram); }
+            { char *p; if ((p = strstr(buf, "\"hddGb\":"))) sscanf(p, "\"hddGb\":%d", &meta_hdd); }
+            { char *p; if ((p = strstr(buf, "\"cpuCores\":"))) sscanf(p, "\"cpuCores\":%d", &meta_cpu); }
+            { char *p; if ((p = strstr(buf, "\"gpuMode\":"))) sscanf(p, "\"gpuMode\":%d", &meta_gpu); }
+            { char *p; if ((p = strstr(buf, "\"networkMode\":"))) sscanf(p, "\"networkMode\":%d", &meta_net); }
+            { char *p; if ((p = strstr(buf, "\"testMode\":"))) sscanf(p, "\"testMode\":%d", &meta_test); }
+            { char *p; if ((p = strstr(buf, "\"sshEnabled\":"))) sscanf(p, "\"sshEnabled\":%d", &meta_ssh); }
+            asb_log(L"Import: read metadata from vm_export.json");
+        }
+        /* Apply config */
+        if (os_type && os_type[0])
+            wcscpy_s(inst->os_type, 32, os_type);
+        else if (meta_os[0])
+            wcscpy_s(inst->os_type, 32, meta_os);
+        else
+            wcscpy_s(inst->os_type, 32, L"Windows");
+        inst->ram_mb = meta_ram > 0 ? meta_ram : 4096;
+        inst->hdd_gb = meta_hdd > 0 ? meta_hdd : 64;
+        inst->cpu_cores = meta_cpu > 0 ? meta_cpu : 4;
+        inst->gpu_mode = meta_gpu;
+        inst->network_mode = meta_net > 0 ? meta_net : 1;
+        /* test_mode: use metadata, or auto-set TRUE for Linux */
+        if (meta_test)
+            inst->test_mode = TRUE;
+        else if (_wcsicmp(inst->os_type, L"Linux") == 0)
+            inst->test_mode = TRUE;
+        inst->ssh_enabled = meta_ssh ? TRUE : FALSE;
+    }
+
     inst->unique_id = g_next_vm_id++;
     wcscpy_s(inst->name, 256, vm_name);
     wcscpy_s(inst->vhdx_path, MAX_PATH, dst_vhdx);
-
-    /* OS type: auto-detect from state file or default to Windows */
-    if (os_type && os_type[0])
-        wcscpy_s(inst->os_type, 32, os_type);
-    else {
-        wchar_t state_path[MAX_PATH];
-        swprintf_s(state_path, MAX_PATH, L"%s\\vm_state.json", vhdx_dir);
-        FILE *f = NULL;
-        if (_wfopen_s(&f, state_path, L"r") == 0 && f) {
-            char buf[256];
-            if (fgets(buf, sizeof(buf), f)) {
-                if (strstr(buf, "\"os_type\":\"Linux\"") ||
-                    strstr(buf, "\"osType\":\"Linux\""))
-                    wcscpy_s(inst->os_type, 32, L"Linux");
-                else
-                    wcscpy_s(inst->os_type, 32, L"Windows");
-            } else {
-                wcscpy_s(inst->os_type, 32, L"Windows");
-            }
-            fclose(f);
-        } else {
-            wcscpy_s(inst->os_type, 32, L"Windows");
-        }
-    }
-
-    /* Defaults for imported VM */
-    inst->ram_mb = 4096;
-    inst->hdd_gb = 64;
-    inst->cpu_cores = 4;
-    inst->gpu_mode = 0;
-    inst->network_mode = 1; /* NAT */
-    inst->test_mode = FALSE;
     inst->install_complete = vm_load_state_json(dst_vhdx);
 
     /* Initialize snapshot tree */
@@ -3631,8 +3768,10 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source_vhdx,
         snapshot_init(&g_snap_trees[g_vm_count], snap_dir);
     }
 
+    EnterCriticalSection(&g_cs);
     g_vm_count++;
     save_vm_list();
+    LeaveCriticalSection(&g_cs);
 
     asb_log(L"Import complete: VM \"%s\" (os=%s, vhdx=%s)",
             vm_name, inst->os_type, dst_vhdx);
