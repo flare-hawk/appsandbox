@@ -41,6 +41,7 @@
 #define FRAME_MAGIC     0x52465341u   /* 'ASFR' little-endian */
 #define CURSOR_MAGIC    0x52435341u   /* 'ASCR' little-endian */
 #define TARGET_FPS      240  /* capture loop pace; actual send rate is gated by fb_id change */
+#define FRAME_INTERVAL_NS (1000000000L / TARGET_FPS)
 
 #define CURSOR_TYPE_MASKED_COLOR  1
 #define CURSOR_TYPE_ALPHA         2
