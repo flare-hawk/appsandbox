@@ -3727,13 +3727,13 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source_vhdx,
             fclose(mf);
             /* Simple JSON parsing */
             { char *p; if ((p = strstr(buf, "\"osType\":\""))) { p += 9; char *e = strchr(p, '"'); if (e) { size_t l = e - p; if (l < 32) { MultiByteToWideChar(CP_UTF8, 0, p, (int)l, meta_os, 32); meta_os[l] = 0; } } } }
-            { char *p; if ((p = strstr(buf, "\"ramMb\":"))) sscanf(p, "\"ramMb\":%d", &meta_ram); }
-            { char *p; if ((p = strstr(buf, "\"hddGb\":"))) sscanf(p, "\"hddGb\":%d", &meta_hdd); }
-            { char *p; if ((p = strstr(buf, "\"cpuCores\":"))) sscanf(p, "\"cpuCores\":%d", &meta_cpu); }
-            { char *p; if ((p = strstr(buf, "\"gpuMode\":"))) sscanf(p, "\"gpuMode\":%d", &meta_gpu); }
-            { char *p; if ((p = strstr(buf, "\"networkMode\":"))) sscanf(p, "\"networkMode\":%d", &meta_net); }
-            { char *p; if ((p = strstr(buf, "\"testMode\":"))) sscanf(p, "\"testMode\":%d", &meta_test); }
-            { char *p; if ((p = strstr(buf, "\"sshEnabled\":"))) sscanf(p, "\"sshEnabled\":%d", &meta_ssh); }
+            { char *p; if ((p = strstr(buf, "\"ramMb\":"))) meta_ram = atoi(p + 8); }
+            { char *p; if ((p = strstr(buf, "\"hddGb\":"))) meta_hdd = atoi(p + 8); }
+            { char *p; if ((p = strstr(buf, "\"cpuCores\":"))) meta_cpu = atoi(p + 11); }
+            { char *p; if ((p = strstr(buf, "\"gpuMode\":"))) meta_gpu = atoi(p + 10); }
+            { char *p; if ((p = strstr(buf, "\"networkMode\":"))) meta_net = atoi(p + 14); }
+            { char *p; if ((p = strstr(buf, "\"testMode\":"))) meta_test = atoi(p + 11); }
+            { char *p; if ((p = strstr(buf, "\"sshEnabled\":"))) meta_ssh = atoi(p + 13); }
             asb_log(L"Import: read metadata from vm_export.json");
         }
         /* Apply config */
