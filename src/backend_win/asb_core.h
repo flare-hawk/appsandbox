@@ -62,6 +62,7 @@ typedef struct {
     BOOL   ssh_enabled;            /* TRUE = install OpenSSH Server in guest */
     BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL   is_template;            /* TRUE = create as template VM */
+    const wchar_t *storage_path;   /* custom storage directory, or NULL for default */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */

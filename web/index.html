@@ -102,6 +102,12 @@
                 <span class="host-info">Downloaded on first create (~600 MB), cached on the host</span>
             </div>
 
+            <label for="storage-path">Storage Path:</label>
+            <div class="form-row">
+                <input type="text" id="storage-path" placeholder="Default (C:\ProgramData\AppSandbox)" autocorrect="off" autocapitalize="off" spellcheck="false" class="input-md">
+                <button id="btn-browse-storage" onclick="sendCmd('browseStorage')">Browse...</button>
+            </div>
+
             <label for="hdd-size">HDD Size:</label>
             <div class="form-row">
                 <input type="number" id="hdd-size" value="64" min="1" class="input-sm"> GB

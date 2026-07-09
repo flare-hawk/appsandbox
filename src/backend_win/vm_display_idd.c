@@ -138,7 +138,7 @@ typedef struct InputPacket {
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
-#define PRESENT_MS      16   /* ~60 fps */
+#define PRESENT_MS      4    /* ~250 Hz timer; frame_dirty gates actual renders */
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -218,6 +218,9 @@ struct VmDisplayIdd {
     ID3D11RenderTargetView  *rtv;
     ID3D11Texture2D         *frame_tex;
     ID3D11ShaderResourceView *frame_srv;
+    UINT           frame_tex_width;   /* current GPU texture width (may differ from frame_width during resize) */
+    UINT           frame_tex_height;  /* current GPU texture height */
+    UINT           target_refresh;    /* target refresh rate in Hz for present timer */
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
@@ -1063,7 +1066,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
     scd.BufferDesc.Width                   = DEFAULT_WIDTH;
     scd.BufferDesc.Height                  = DEFAULT_HEIGHT;
     scd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
-    scd.BufferDesc.RefreshRate.Numerator   = 60;
+    scd.BufferDesc.RefreshRate.Numerator   = d->target_refresh ? d->target_refresh : 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
     scd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.OutputWindow                       = d->render_hwnd;
@@ -1175,6 +1178,57 @@ static BOOL d3d_init(VmDisplayIdd *d)
     return TRUE;
 }
 
+/* Recreate the GPU frame texture + SRV when the guest resolution changes.
+ * Must be called from the window thread (D3D11 device context thread).
+ * Caller must NOT hold frame_cs. */
+static void d3d_recreate_frame_texture(VmDisplayIdd *d, UINT width, UINT height)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    HRESULT hr;
+
+    if (!d->device) return;
+    if (width == d->frame_tex_width && height == d->frame_tex_height) return;
+
+    /* Release old texture + SRV */
+    if (d->frame_srv) { d->frame_srv->lpVtbl->Release(d->frame_srv); d->frame_srv = NULL; }
+    if (d->frame_tex) { d->frame_tex->lpVtbl->Release(d->frame_tex); d->frame_tex = NULL; }
+
+    ZeroMemory(&td, sizeof(td));
+    td.Width              = width;
+    td.Height             = height;
+    td.MipLevels          = 1;
+    td.ArraySize          = 1;
+    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count   = 1;
+    td.Usage              = D3D11_USAGE_DYNAMIC;
+    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
+
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateTexture2D (resize) failed (0x%08X)", hr);
+        return;
+    }
+
+    ZeroMemory(&srv_desc, sizeof(srv_desc));
+    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels       = 1;
+    srv_desc.Texture2D.MostDetailedMip  = 0;
+
+    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
+            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateShaderResourceView (resize) failed (0x%08X)", hr);
+        return;
+    }
+
+    d->frame_tex_width  = width;
+    d->frame_tex_height = height;
+    idd_log(d, L"D3D texture recreated: %ux%u", width, height);
+}
+
 static void d3d_resize_swap_chain(VmDisplayIdd *d)
 {
     RECT rc;
@@ -1225,6 +1279,11 @@ static void d3d_render_frame(VmDisplayIdd *d)
         return;
 
     /* Upload frame data to GPU texture if dirty */
+    /* Recreate GPU texture if the guest resolution changed since last frame */
+    if (d->frame_dirty && d->device &&
+        (d->frame_width != d->frame_tex_width || d->frame_height != d->frame_tex_height)) {
+        d3d_recreate_frame_texture(d, d->frame_width, d->frame_height);
+    }
     if (d->frame_dirty) {
         EnterCriticalSection(&d->frame_cs);
         hr = d->ctx->lpVtbl->Map(d->ctx,
@@ -1238,7 +1297,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (copy_stride > d->frame_stride)
                 copy_stride = d->frame_stride;
 
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
+            for (row = 0; row < d->frame_height && row < d->frame_tex_height; row++) {
                 memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
                        d->frame_buf + row * d->frame_stride,
                        copy_stride);
@@ -1994,7 +2053,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     }
 
     /* Start a present timer for steady rendering */
-    SetTimer(d->hwnd, IDT_PRESENT, PRESENT_MS, NULL);
+    SetTimer(d->hwnd, IDT_PRESENT,
+             d->target_refresh > 0 ? (1000 / d->target_refresh) : PRESENT_MS, NULL);
 
     /* Install the hotkey hook on this (message-pumping) thread if the
        persisted setting has Transmit mode enabled. */
@@ -2391,6 +2451,9 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->frame_width  = DEFAULT_WIDTH;
     d->frame_height = DEFAULT_HEIGHT;
     d->frame_stride = DEFAULT_WIDTH * 4;
+    d->frame_tex_width  = DEFAULT_WIDTH;
+    d->frame_tex_height = DEFAULT_HEIGHT;
+    d->target_refresh   = 60;
     d->frame_buf    = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                          d->frame_stride * d->frame_height);
     if (!d->frame_buf) {

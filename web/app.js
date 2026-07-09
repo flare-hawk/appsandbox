@@ -142,6 +142,7 @@ window.onHostMessage = function(msg) {
         case 'log':           appendLog(msg.message); break;
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
+        case 'browseStorageResult': onBrowseStorageResult(msg.path); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
@@ -342,6 +343,12 @@ function onBrowseResult(path) {
     }
 }
 
+function onBrowseStorageResult(path) {
+    if (path) {
+        document.getElementById('storage-path').value = path;
+    }
+}
+
 /* ---- Create buttons state ---- */
 
 function updateCreateButtons() {
@@ -452,7 +459,8 @@ function gatherConfig() {
         adminConfirm: document.getElementById('admin-confirm').value,
         testMode:    document.getElementById('test-mode').checked,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
-        sshDeployKey: document.getElementById('ssh-deploy-key').checked
+        sshDeployKey: document.getElementById('ssh-deploy-key').checked,
+        storagePath:  document.getElementById('storage-path').value.trim()
     };
 }
 
@@ -469,6 +477,7 @@ function clearCreateForm() {
     document.getElementById('image-path').value = '';
     selectTemplate('', templateDefaultLabel());
     updateCreateButtons();
+    document.getElementById('storage-path').value = '';
 }
 
 /* VM name / hostname validation. Per-guest-OS rules, keyed off the

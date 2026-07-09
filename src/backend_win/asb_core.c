@@ -1931,47 +1931,114 @@ static int detect_iso_kernel(const wchar_t *iso_path,
     }
 
     /* 2. Kernel version from linux-headers-<X.Y.Z-generic>_*_amd64.deb
-     *    in pool/main/l/linux/. We use linux-headers- not linux-image-
-     *    because the image .deb lives under pool/main/l/linux-signed/
-     *    on signed-kernel Ubuntu releases, but the headers (which we
-     *    need anyway for DKMS builds) are in pool/main/l/linux/ on all
-     *    release flavors. The kver substring is identical.
+     *    or linux-image-<X.Y.Z-generic>_*_amd64.deb.
      *
-     *    Filename pattern (literal example):
-     *      linux-headers-7.0.0-14-generic_7.0.0-14.14_amd64.deb
+     *    Original approach only looked in pool/main/l/linux/ for headers,
+     *    but different Ubuntu releases and derivatives put kernel packages
+     *    in different subdirs:
+     *      - 24.04/26.04: pool/main/l/linux/linux-headers-*generic*.deb
+     *      - 22.04 (HWE): pool/main/l/linux-hwe-6.X/linux-headers-*generic*.deb
+     *      - Kubuntu/derivatives: pool is smaller, headers may be absent
+     *        (only linux-image under linux-signed-*)
+     *
+     *    Strategy: recursively search pool/main/l/{subdirs}/ for any
+     *    linux-headers-*generic*.deb first, then fall back to
+     *    linux-image-*generic*.deb (parsing the version from the filename
+     *    works the same way).
      *
      *    FindFirstFileW doesn't reliably handle multi-`*` patterns on
-     *    ISO 9660; glob with single wildcard and filter for "-generic_". */
+     *    ISO 9660, so we enumerate subdirs and filter client-side. */
     {
-        wchar_t spec[MAX_PATH];
-        swprintf_s(spec, MAX_PATH,
-            L"%c:\\pool\\main\\l\\linux\\linux-headers-*.deb", iso_drive);
-        WIN32_FIND_DATAW fd;
-        HANDLE fh = FindFirstFileW(spec, &fd);
-        if (fh == INVALID_HANDLE_VALUE) {
-            asb_log(L"detect_iso_kernel: no linux-headers-*.deb in pool/main/l/linux");
-            goto cleanup;
+        wchar_t ldir[MAX_PATH];
+        swprintf_s(ldir, MAX_PATH, L"%c:\\pool\\main\\l", iso_drive);
+        WIN32_FIND_DATAW sfd;
+        HANDLE sfh = FindFirstFileW(ldir, &sfd);
+        /* If FindFirstFileW on a bare dir fails on ISO 9660, try with \* */
+        if (sfh == INVALID_HANDLE_VALUE) {
+            wchar_t spec[MAX_PATH];
+            swprintf_s(spec, MAX_PATH, L"%c:\\pool\\main\\l\\*", iso_drive);
+            sfh = FindFirstFileW(spec, &sfd);
         }
         int found = 0;
-        do {
-            /* Skip the meta-package "linux-headers-X.Y.Z_<ver>_all.deb"
-             * (no "-generic_"). We want the per-flavor headers. */
-            if (!wcsstr(fd.cFileName, L"-generic_")) continue;
-            const wchar_t *p = wcsstr(fd.cFileName, L"linux-headers-");
-            if (!p) continue;
-            p += wcslen(L"linux-headers-");
-            const wchar_t *u = wcschr(p, L'_');
-            if (!u) continue;
-            size_t n = (size_t)(u - p);
-            if (n == 0 || n >= kver_cap) continue;
-            wcsncpy_s(kver_out, kver_cap, p, n);
-            kver_out[n] = 0;
-            found = 1;
-            break;
-        } while (FindNextFileW(fh, &fd));
-        FindClose(fh);
+        if (sfh != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(sfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (sfd.cFileName[0] == L'.') continue;
+
+                /* Search this subdir for linux-headers-*generic*.deb */
+                wchar_t spec[MAX_PATH];
+                swprintf_s(spec, MAX_PATH,
+                    L"%c:\\pool\\main\\l\\%s\\linux-headers-*.deb",
+                    iso_drive, sfd.cFileName);
+                WIN32_FIND_DATAW fd;
+                HANDLE fh = FindFirstFileW(spec, &fd);
+                if (fh != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (!wcsstr(fd.cFileName, L"-generic_")) continue;
+                        const wchar_t *p = wcsstr(fd.cFileName, L"linux-headers-");
+                        if (!p) continue;
+                        p += wcslen(L"linux-headers-");
+                        const wchar_t *u = wcschr(p, L'_');
+                        if (!u) continue;
+                        size_t n = (size_t)(u - p);
+                        if (n == 0 || n >= kver_cap) continue;
+                        wcsncpy_s(kver_out, kver_cap, p, n);
+                        kver_out[n] = 0;
+                        found = 1;
+                        break;
+                    } while (FindNextFileW(fh, &fd));
+                    FindClose(fh);
+                }
+                if (found) break;
+            } while (FindNextFileW(sfh, &sfd));
+            FindClose(sfh);
+        }
+
+        /* Fallback: search for linux-image-<ver>-generic debs in pool/main/l subdirs */
         if (!found) {
-            asb_log(L"detect_iso_kernel: no linux-headers-*-generic_*.deb found");
+            swprintf_s(ldir, MAX_PATH, L"%c:\\pool\\main\\l", iso_drive);
+            sfh = FindFirstFileW(ldir, &sfd);
+            if (sfh == INVALID_HANDLE_VALUE) {
+                wchar_t spec[MAX_PATH];
+                swprintf_s(spec, MAX_PATH, L"%c:\\pool\\main\\l\\*", iso_drive);
+                sfh = FindFirstFileW(spec, &sfd);
+            }
+            if (sfh != INVALID_HANDLE_VALUE) {
+                do {
+                    if (!(sfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                    if (sfd.cFileName[0] == L'.') continue;
+
+                    wchar_t spec[MAX_PATH];
+                    swprintf_s(spec, MAX_PATH,
+                        L"%c:\\pool\\main\\l\\%s\\linux-image-*.deb",
+                        iso_drive, sfd.cFileName);
+                    WIN32_FIND_DATAW fd;
+                    HANDLE fh = FindFirstFileW(spec, &fd);
+                    if (fh != INVALID_HANDLE_VALUE) {
+                        do {
+                            if (!wcsstr(fd.cFileName, L"-generic_")) continue;
+                            const wchar_t *p = wcsstr(fd.cFileName, L"linux-image-");
+                            if (!p) continue;
+                            p += wcslen(L"linux-image-");
+                            const wchar_t *u = wcschr(p, L'_');
+                            if (!u) continue;
+                            size_t n = (size_t)(u - p);
+                            if (n == 0 || n >= kver_cap) continue;
+                            wcsncpy_s(kver_out, kver_cap, p, n);
+                            kver_out[n] = 0;
+                            found = 1;
+                            break;
+                        } while (FindNextFileW(fh, &fd));
+                        FindClose(fh);
+                    }
+                    if (found) break;
+                } while (FindNextFileW(sfh, &sfd));
+                FindClose(sfh);
+            }
+        }
+
+        if (!found) {
+            asb_log(L"detect_iso_kernel: no kernel headers/image deb with -generic_ found");
             goto cleanup;
         }
     }
@@ -2643,6 +2710,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     }
     is_template_create = config->is_template;
     cfg.is_template = is_template_create;
+    if (config->storage_path && config->storage_path[0] != L'\0')
+        wcscpy_s(cfg.vhdx_base_dir, MAX_PATH, config->storage_path);
+    else
+        cfg.vhdx_base_dir[0] = L'\0';
 
     /* Defaults */
     if (cfg.hdd_gb == 0) cfg.hdd_gb = 64;
@@ -2741,20 +2812,39 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (cfg.admin_user[0] == L'\0')
         wcscpy_s(cfg.admin_user, 128, L"User");
 
-    /* Create VHDX directory */
+    /* Create VHDX directory — use custom storage path if specified,
+       otherwise fall back to %ProgramData%\AppSandbox. */
     {
         wchar_t base_dir[MAX_PATH];
-        if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
-            wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
-        swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox", base_dir);
-        CreateDirectoryW(vhdx_dir, NULL);
-
-        if (is_template_create) {
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
+        if (cfg.vhdx_base_dir[0] != L'\0') {
+            /* User-specified storage path: create it as the VM root
+               directly (no \AppSandbox suffix). */
+            wcscpy_s(base_dir, MAX_PATH, cfg.vhdx_base_dir);
+            /* Ensure the base directory exists */
+            CreateDirectoryW(base_dir, NULL);
+            swprintf_s(vhdx_dir, MAX_PATH, L"%s", base_dir);
             CreateDirectoryW(vhdx_dir, NULL);
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, cfg.name);
+
+            if (is_template_create) {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\templates", base_dir);
+                CreateDirectoryW(vhdx_dir, NULL);
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\templates\\%s", base_dir, cfg.name);
+            } else {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\%s", base_dir, cfg.name);
+            }
         } else {
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\%s", base_dir, cfg.name);
+            if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
+                wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
+            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox", base_dir);
+            CreateDirectoryW(vhdx_dir, NULL);
+
+            if (is_template_create) {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
+                CreateDirectoryW(vhdx_dir, NULL);
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, cfg.name);
+            } else {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\%s", base_dir, cfg.name);
+            }
         }
     }
     CreateDirectoryW(vhdx_dir, NULL);
