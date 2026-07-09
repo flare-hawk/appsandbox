@@ -3675,7 +3675,7 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source_vhdx,
             { char *p; if ((p = strstr(buf, "\"testMode\":"))) meta_test = atoi(p + 11); }
             { char *p; if ((p = strstr(buf, "\"sshEnabled\":"))) meta_ssh = atoi(p + 13); }
             { char *p; if ((p = strstr(buf, "\"adminUser\":\""))) { p += 13; char *e = strchr(p, '"'); if (e) { size_t l = e - p; if (l < 128) { MultiByteToWideChar(CP_UTF8, 0, p, (int)l, meta_user, 128); meta_user[l] = 0; } } } }
-            { char *p; if ((p = strstr(buf, "\"vmRoot\":\""))) { p += 9; char *e = strchr(p, '"'); if (e) { size_t l = e - p; if (l < MAX_PATH) { MultiByteToWideChar(CP_UTF8, 0, p, (int)l, meta_root, MAX_PATH); meta_root[l] = 0; } } } }
+            { char *p; if ((p = strstr(buf, "\"vmRoot\":\""))) { p += 10; char *e = strchr(p, '"'); if (e) { size_t l = e - p; if (l < MAX_PATH) { MultiByteToWideChar(CP_UTF8, 0, p, (int)l, meta_root, MAX_PATH); meta_root[l] = 0; } } } }
             asb_log(L"Import: read metadata from vm_export.json");
         }
     }
