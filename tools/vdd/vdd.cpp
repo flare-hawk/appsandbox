@@ -104,23 +104,33 @@ static const BYTE* VddGetEdid()
 /*  Monitor mode helper                                                      */
 /* ========================================================================= */
 
-static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyncDivider)
+static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig,
+                                 UINT width, UINT height, UINT vSyncDivider)
 {
     /* totalSize == activeSize, pixelRate = refresh * w * h.
        IddCx validates these relationships; using actual blanking values causes
        STATUS_INVALID_PARAMETER from IddCxMonitorArrival. */
-    sig->totalSize.cx                           = VDD_WIDTH;
-    sig->totalSize.cy                           = VDD_HEIGHT;
-    sig->activeSize.cx                          = VDD_WIDTH;
-    sig->activeSize.cy                          = VDD_HEIGHT;
+    sig->totalSize.cx                           = width;
+    sig->totalSize.cy                           = height;
+    sig->activeSize.cx                          = width;
+    sig->activeSize.cy                          = height;
     sig->AdditionalSignalInfo.vSyncFreqDivider  = vSyncDivider;
     sig->AdditionalSignalInfo.videoStandard     = 255;
     sig->vSyncFreq.Numerator                    = 60;
     sig->vSyncFreq.Denominator                  = 1;
-    sig->hSyncFreq.Numerator                    = 60 * VDD_HEIGHT;
+    sig->hSyncFreq.Numerator                    = 60 * height;
     sig->hSyncFreq.Denominator                  = 1;
     sig->scanLineOrdering                       = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    sig->pixelRate                               = (UINT64)60 * VDD_WIDTH * VDD_HEIGHT;
+    sig->pixelRate                               = (UINT64)60 * width * height;
+}
+
+static void VddFillMonitorMode(IDDCX_MONITOR_MODE* mode, UINT index, UINT origin)
+{
+    mode->Size = sizeof(*mode);
+    mode->Origin = origin;
+    VddCreateMonitorMode(&mode->MonitorVideoSignalInfo,
+                         g_SupportedResolutions[index].width,
+                         g_SupportedResolutions[index].height, 0);
 }
 
 /* ========================================================================= */
@@ -868,9 +878,12 @@ static void VddContextInit(VDD_DEVICE_CONTEXT* ctx, WDFDEVICE device)
     memset(ctx, 0, sizeof(*ctx));
     ctx->wdfDevice = device;
 
-    /* Pre-populate the single 1920x1080@60Hz mode */
-    VddCreateMonitorMode(&ctx->modes[0], 0);  /* vSyncDivider=0 for monitor modes */
-    ctx->modeCount = 1;
+    /* Pre-populate the advertised 60Hz monitor modes. */
+    for (UINT i = 0; i < g_NumResolutions; ++i)
+        VddCreateMonitorMode(&ctx->modes[i],
+                             g_SupportedResolutions[i].width,
+                             g_SupportedResolutions[i].height, 0);
+    ctx->modeCount = g_NumResolutions;
 }
 
 static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
@@ -1266,21 +1279,20 @@ NTSTATUS VddParseMonitorDescription(
 {
     VddLog("ParseMonitorDescription: InputCount=%u", pInArgs->MonitorModeBufferInputCount);
 
-    pOutArgs->MonitorModeBufferOutputCount = 1;
+    pOutArgs->MonitorModeBufferOutputCount = g_NumResolutions;
 
     if (pInArgs->MonitorModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->MonitorModeBufferInputCount < 1)
+    if (pInArgs->MonitorModeBufferInputCount < g_NumResolutions)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_MONITOR_MODE* pMode = pInArgs->pMonitorModes;
-    pMode->Size = sizeof(IDDCX_MONITOR_MODE);
-    pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-    VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0); /* vSyncDivider=0 for monitor modes */
+    for (UINT i = 0; i < g_NumResolutions; ++i)
+        VddFillMonitorMode(&pInArgs->pMonitorModes[i], i,
+                           IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR);
 
     pOutArgs->PreferredMonitorModeIdx = 0;
-    VddLog("ParseMonitorDescription: returning 1 mode (1920x1080@60)");
+    VddLog("ParseMonitorDescription: returning %u modes", g_NumResolutions);
     return STATUS_SUCCESS;
 }
 
@@ -1298,21 +1310,20 @@ NTSTATUS VddMonitorGetDefaultModes(
 
     VddLog("GetDefaultModes: InputCount=%u", pInArgs->DefaultMonitorModeBufferInputCount);
 
-    pOutArgs->DefaultMonitorModeBufferOutputCount = 1;
+    pOutArgs->DefaultMonitorModeBufferOutputCount = g_NumResolutions;
     pOutArgs->PreferredMonitorModeIdx = 0;
 
     if (pInArgs->DefaultMonitorModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->DefaultMonitorModeBufferInputCount < 1)
+    if (pInArgs->DefaultMonitorModeBufferInputCount < g_NumResolutions)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_MONITOR_MODE* pMode = pInArgs->pDefaultMonitorModes;
-    pMode->Size = sizeof(IDDCX_MONITOR_MODE);
-    pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-    VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0); /* vSyncDivider=0 for monitor modes */
+    for (UINT i = 0; i < g_NumResolutions; ++i)
+        VddFillMonitorMode(&pInArgs->pDefaultMonitorModes[i], i,
+                           IDDCX_MONITOR_MODE_ORIGIN_DRIVER);
 
-    VddLog("GetDefaultModes: returning 1 default mode");
+    VddLog("GetDefaultModes: returning %u default modes", g_NumResolutions);
     return STATUS_SUCCESS;
 }
 
@@ -1330,19 +1341,23 @@ NTSTATUS VddMonitorQueryTargetModes(
 
     VddLog("QueryTargetModes: InputCount=%u", pInArgs->TargetModeBufferInputCount);
 
-    pOutArgs->TargetModeBufferOutputCount = 1;
+    pOutArgs->TargetModeBufferOutputCount = g_NumResolutions;
 
     if (pInArgs->TargetModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->TargetModeBufferInputCount < 1)
+    if (pInArgs->TargetModeBufferInputCount < g_NumResolutions)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_TARGET_MODE* pMode = pInArgs->pTargetModes;
-    pMode->Size = sizeof(IDDCX_TARGET_MODE);
-    VddCreateMonitorMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo, 1); /* vSyncDivider=1 for TARGET modes */
+    for (UINT i = 0; i < g_NumResolutions; ++i) {
+        IDDCX_TARGET_MODE* pMode = &pInArgs->pTargetModes[i];
+        pMode->Size = sizeof(*pMode);
+        VddCreateMonitorMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo,
+                             g_SupportedResolutions[i].width,
+                             g_SupportedResolutions[i].height, 1);
+    }
 
-    VddLog("QueryTargetModes: returning 1 target mode");
+    VddLog("QueryTargetModes: returning %u target modes", g_NumResolutions);
     return STATUS_SUCCESS;
 }
 
@@ -1395,22 +1410,26 @@ NTSTATUS VddParseMonitorDescription2(
 {
     VddLog("ParseMonitorDescription2: InputCount=%u", pInArgs->MonitorModeBufferInputCount);
 
-    pOutArgs->MonitorModeBufferOutputCount = 1;
+    pOutArgs->MonitorModeBufferOutputCount = g_NumResolutions;
 
     if (pInArgs->MonitorModeBufferInputCount == 0)
         return STATUS_SUCCESS;
 
-    if (pInArgs->MonitorModeBufferInputCount < 1)
+    if (pInArgs->MonitorModeBufferInputCount < g_NumResolutions)
         return STATUS_BUFFER_TOO_SMALL;
 
-    IDDCX_MONITOR_MODE2* pMode = pInArgs->pMonitorModes;
-    pMode->Size = sizeof(IDDCX_MONITOR_MODE2);
-    pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-    VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0);
-    pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+    for (UINT i = 0; i < g_NumResolutions; ++i) {
+        IDDCX_MONITOR_MODE2* pMode = &pInArgs->pMonitorModes[i];
+        pMode->Size = sizeof(*pMode);
+        pMode->Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+        VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo,
+                             g_SupportedResolutions[i].width,
+                             g_SupportedResolutions[i].height, 0);
+        pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+    }
 
     pOutArgs->PreferredMonitorModeIdx = 0;
-    VddLog("ParseMonitorDescription2: returning 1 mode (8bpc)");
+    VddLog("ParseMonitorDescription2: returning %u modes (8bpc)", g_NumResolutions);
     return STATUS_SUCCESS;
 }
 
@@ -1428,17 +1447,21 @@ NTSTATUS VddMonitorQueryTargetModes2(
 
     VddLog("QueryTargetModes2: InputCount=%u", pInArgs->TargetModeBufferInputCount);
 
-    pOutArgs->TargetModeBufferOutputCount = 1;
+    pOutArgs->TargetModeBufferOutputCount = g_NumResolutions;
 
-    if (pInArgs->TargetModeBufferInputCount >= 1)
-    {
-        IDDCX_TARGET_MODE2* pMode = pInArgs->pTargetModes;
+    if (pInArgs->TargetModeBufferInputCount < g_NumResolutions)
+        return STATUS_BUFFER_TOO_SMALL;
+
+    for (UINT i = 0; i < g_NumResolutions; ++i) {
+        IDDCX_TARGET_MODE2* pMode = &pInArgs->pTargetModes[i];
         pMode->Size = sizeof(IDDCX_TARGET_MODE2);
         pMode->BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
-        VddCreateMonitorMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo, 1);
+        VddCreateMonitorMode(&pMode->TargetVideoSignalInfo.targetVideoSignalInfo,
+                             g_SupportedResolutions[i].width,
+                             g_SupportedResolutions[i].height, 1);
     }
 
-    VddLog("QueryTargetModes2: returning 1 target mode (8bpc)");
+    VddLog("QueryTargetModes2: returning %u target modes (8bpc)", g_NumResolutions);
     return STATUS_SUCCESS;
 }
 

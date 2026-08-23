@@ -83,7 +83,7 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
 #pragma pack(pop)
 
 /* ============================================================================
- *  Supported resolutions and refresh rates (single mode for this driver)
+ *  Supported resolutions and refresh rates
  * ============================================================================ */
 struct ResolutionEntry {
     UINT width;
@@ -91,7 +91,16 @@ struct ResolutionEntry {
 };
 
 static const ResolutionEntry g_SupportedResolutions[] = {
+    { 1280,  720 },
+    { 1366,  768 },
+    { 1600,  900 },
     { 1920, 1080 },
+    { 2560, 1440 },
+    { 3840, 2160 },
+    { 2560, 1080 }, /* 21:9 ultrawide */
+    { 3440, 1440 }, /* 21:9 ultrawide */
+    { 3840, 1600 }, /* 24:10 ultrawide */
+    { 5120, 1440 }, /* 32:9 super ultrawide */
 };
 
 static const UINT g_NumResolutions = ARRAYSIZE(g_SupportedResolutions);
@@ -227,7 +236,7 @@ typedef struct _VDD_DEVICE_CONTEXT {
     LUID                cachedDeviceLuid;
 
     /* Monitor mode list */
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* 1920x1080@60 (monitor + target) */
+    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[16]; /* advertised monitor modes */
     UINT                modeCount;
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
