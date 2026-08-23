@@ -26,6 +26,7 @@
 #include <stdarg.h>
 #include <virtdisk.h>
 #pragma comment(lib, "virtdisk.lib")
+#pragma comment(lib, "shell32.lib")
 
 /* ---- DLL module handle (for locating iso-patch.exe, resources, etc.) ---- */
 
@@ -731,6 +732,33 @@ static void remove_dir_recursive(const wchar_t *dir)
         FindClose(h);
     }
     RemoveDirectoryW(dir);
+}
+
+/* ---- Utility: recursive directory copy ---- */
+
+static BOOL copy_dir_recursive(const wchar_t *src, const wchar_t *dst)
+{
+    wchar_t src_pattern[MAX_PATH], src_full[MAX_PATH], dst_full[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+
+    CreateDirectoryW(dst, NULL);
+    swprintf_s(src_pattern, MAX_PATH, L"%s\\*", src);
+    h = FindFirstFileW(src_pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == L'\0' ||
+            (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
+            continue;
+        swprintf_s(src_full, MAX_PATH, L"%s\\%s", src, fd.cFileName);
+        swprintf_s(dst_full, MAX_PATH, L"%s\\%s", dst, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            copy_dir_recursive(src_full, dst_full);
+        else
+            CopyFileW(src_full, dst_full, FALSE);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return TRUE;
 }
 
 /* ---- HCS state callback (called from HCS worker thread) ---- */
@@ -1802,6 +1830,35 @@ static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
         asb_log(L"Linux hostname: staged /etc/appsandbox-hostname = %s", vm_name);
     }
 
+    /* Stage the host's display resolution + refresh rate so the guest's
+     * asb_drm module can match it at boot. Format: "WxHxR" e.g. "1920x1080x60".
+     * The firstboot script reads /etc/appsandbox-display-config and overrides
+     * the default modprobe.d-asb_drm.conf with these values. */
+    {
+        DEVMODEW dm;
+        ZeroMemory(&dm, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) &&
+            dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0 && dm.dmDisplayFrequency > 1) {
+            char disp_cfg[32];
+            unsigned long freq = dm.dmDisplayFrequency;
+            /* Cap at 144Hz: higher rates saturate the Hyper-V socket transport
+             * (2560x1600x4x240 ~ 3.9 GB/s raw bandwidth). 144Hz is a good
+             * balance between smoothness and bandwidth. */
+            if (freq > 144) freq = 144;
+            int dl = _snprintf_s(disp_cfg, sizeof(disp_cfg), _TRUNCATE,
+                                 "%lux%lux%lu",
+                                 (unsigned long)dm.dmPelsWidth,
+                                 (unsigned long)dm.dmPelsHeight,
+                                 freq);
+            if (dl > 0) {
+                n += stage_marker_file(f, staging, L"display-config.marker",
+                                       disp_cfg, (size_t)dl,
+                                       L"/etc/appsandbox-display-config");
+                asb_log(L"Linux display config: staged /etc/appsandbox-display-config = %hs", disp_cfg);
+            }
+        }
+    }
     fclose(f);
     asb_log(L"Linux staging manifest written: %s (%d file(s))", manifest_path, n);
     return n;
@@ -1931,47 +1988,107 @@ static int detect_iso_kernel(const wchar_t *iso_path,
     }
 
     /* 2. Kernel version from linux-headers-<X.Y.Z-generic>_*_amd64.deb
-     *    in pool/main/l/linux/. We use linux-headers- not linux-image-
-     *    because the image .deb lives under pool/main/l/linux-signed/
-     *    on signed-kernel Ubuntu releases, but the headers (which we
-     *    need anyway for DKMS builds) are in pool/main/l/linux/ on all
-     *    release flavors. The kver substring is identical.
+     *    or linux-image-<X.Y.Z-generic>_*_amd64.deb.
      *
-     *    Filename pattern (literal example):
-     *      linux-headers-7.0.0-14-generic_7.0.0-14.14_amd64.deb
+     *    Original approach only looked in pool/main/l/linux/ for headers,
+     *    but different Ubuntu releases and derivatives put kernel packages
+     *    in different subdirs:
+     *      - 24.04/26.04: pool/main/l/linux/linux-headers-*generic*.deb
+     *      - 22.04 (HWE): pool/main/l/linux-hwe-6.X/linux-headers-*generic*.deb
+     *      - Kubuntu/derivatives: pool is smaller, headers may be absent
+     *        (only linux-image under linux-signed-*)
+     *
+     *    Strategy: recursively search pool/main/l/{subdirs}/ for any
+     *    linux-headers-*generic*.deb first, then fall back to
+     *    linux-image-*generic*.deb (parsing the version from the filename
+     *    works the same way).
      *
      *    FindFirstFileW doesn't reliably handle multi-`*` patterns on
-     *    ISO 9660; glob with single wildcard and filter for "-generic_". */
+     *    ISO 9660, so we enumerate subdirs and filter client-side. */
     {
         wchar_t spec[MAX_PATH];
-        swprintf_s(spec, MAX_PATH,
-            L"%c:\\pool\\main\\l\\linux\\linux-headers-*.deb", iso_drive);
-        WIN32_FIND_DATAW fd;
-        HANDLE fh = FindFirstFileW(spec, &fd);
-        if (fh == INVALID_HANDLE_VALUE) {
-            asb_log(L"detect_iso_kernel: no linux-headers-*.deb in pool/main/l/linux");
-            goto cleanup;
-        }
+        WIN32_FIND_DATAW sfd;
+        /* FindFirstFileW requires a wildcard to enumerate directory contents.
+           A bare directory path always returns INVALID_HANDLE_VALUE. */
+        swprintf_s(spec, MAX_PATH, L"%c:\\pool\\main\\l\\*", iso_drive);
+        HANDLE sfh = FindFirstFileW(spec, &sfd);
         int found = 0;
-        do {
-            /* Skip the meta-package "linux-headers-X.Y.Z_<ver>_all.deb"
-             * (no "-generic_"). We want the per-flavor headers. */
-            if (!wcsstr(fd.cFileName, L"-generic_")) continue;
-            const wchar_t *p = wcsstr(fd.cFileName, L"linux-headers-");
-            if (!p) continue;
-            p += wcslen(L"linux-headers-");
-            const wchar_t *u = wcschr(p, L'_');
-            if (!u) continue;
-            size_t n = (size_t)(u - p);
-            if (n == 0 || n >= kver_cap) continue;
-            wcsncpy_s(kver_out, kver_cap, p, n);
-            kver_out[n] = 0;
-            found = 1;
-            break;
-        } while (FindNextFileW(fh, &fd));
-        FindClose(fh);
+        if (sfh != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(sfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (sfd.cFileName[0] == L'.') continue;
+                /* Guard against path overflow on malformed ISO dir names */
+                if (wcslen(sfd.cFileName) > MAX_PATH - 40) continue;
+
+                /* Search this subdir for linux-headers-*.deb */
+                swprintf_s(spec, MAX_PATH,
+                    L"%c:\\pool\\main\\l\\%s\\linux-headers-*.deb",
+                    iso_drive, sfd.cFileName);
+                WIN32_FIND_DATAW fd;
+                HANDLE fh = FindFirstFileW(spec, &fd);
+                if (fh != INVALID_HANDLE_VALUE) {
+                    do {
+                        /* Skip meta-packages (_all.deb); we need per-flavor */
+                        if (wcsstr(fd.cFileName, L"_all.deb")) continue;
+                        const wchar_t *p = wcsstr(fd.cFileName, L"linux-headers-");
+                        if (!p) continue;
+                        p += wcslen(L"linux-headers-");
+                        const wchar_t *u = wcschr(p, L'_');
+                        if (!u) continue;
+                        size_t n = (size_t)(u - p);
+                        if (n == 0 || n >= kver_cap) continue;
+                        wcsncpy_s(kver_out, kver_cap, p, n);
+                        kver_out[n] = 0;
+                        found = 1;
+                        break;
+                    } while (FindNextFileW(fh, &fd));
+                    FindClose(fh);
+                }
+                if (found) break;
+            } while (FindNextFileW(sfh, &sfd));
+            FindClose(sfh);
+        }
+
+        /* Fallback: search for linux-image-*.deb in pool/main/l subdirs */
         if (!found) {
-            asb_log(L"detect_iso_kernel: no linux-headers-*-generic_*.deb found");
+            swprintf_s(spec, MAX_PATH, L"%c:\\pool\\main\\l\\*", iso_drive);
+            sfh = FindFirstFileW(spec, &sfd);
+            if (sfh != INVALID_HANDLE_VALUE) {
+                do {
+                    if (!(sfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                    if (sfd.cFileName[0] == L'.') continue;
+                    if (wcslen(sfd.cFileName) > MAX_PATH - 40) continue;
+
+                    swprintf_s(spec, MAX_PATH,
+                        L"%c:\\pool\\main\\l\\%s\\linux-image-*.deb",
+                        iso_drive, sfd.cFileName);
+                    WIN32_FIND_DATAW fd;
+                    HANDLE fh = FindFirstFileW(spec, &fd);
+                    if (fh != INVALID_HANDLE_VALUE) {
+                        do {
+                            if (wcsstr(fd.cFileName, L"_all.deb")) continue;
+                            const wchar_t *p = wcsstr(fd.cFileName, L"linux-image-");
+                            if (!p) continue;
+                            p += wcslen(L"linux-image-");
+                            const wchar_t *u = wcschr(p, L'_');
+                            if (!u) continue;
+                            size_t n = (size_t)(u - p);
+                            if (n == 0 || n >= kver_cap) continue;
+                            wcsncpy_s(kver_out, kver_cap, p, n);
+                            kver_out[n] = 0;
+                            found = 1;
+                            break;
+                        } while (FindNextFileW(fh, &fd));
+                        FindClose(fh);
+                    }
+                    if (found) break;
+                } while (FindNextFileW(sfh, &sfd));
+                FindClose(sfh);
+            }
+        }
+
+        if (!found) {
+            asb_log(L"detect_iso_kernel: no kernel headers/image deb found");
             goto cleanup;
         }
     }
@@ -2003,21 +2120,79 @@ static int spawn_iso_patch_prefetch(const wchar_t *args)
     swprintf_s(cmdline, 2048,
         L"\"%s\\iso-patch.exe\" %s", exe_dir, args);
 
+    /* Create a pipe to capture iso-patch.exe stdout+stderr */
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hReadPipe = NULL, hWritePipe = NULL;
+    CreatePipe(&hReadPipe, &hWritePipe, &sa, 0);
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
-    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
     si.wShowWindow = SW_HIDE;
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.hStdInput = NULL;
+
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         asb_log(L"prefetch: CreateProcess failed (%lu) for: %s",
                 GetLastError(), cmdline);
+        if (hReadPipe) CloseHandle(hReadPipe);
+        if (hWritePipe) CloseHandle(hWritePipe);
         return -1;
     }
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(hWritePipe);  /* parent doesn't need the write end */
+
+    /* Read iso-patch.exe output line by line, forward to asb_log */
+    char buf[4096];
+    DWORD total = 0;
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) {
+            /* Check if process exited */
+            if (WaitForSingleObject(pi.hProcess, 100) != WAIT_TIMEOUT)
+                break;
+            continue;
+        }
+        DWORD n = avail > sizeof(buf) - 1 ? sizeof(buf) - 1 : avail;
+        DWORD rd = 0;
+        if (!ReadFile(hReadPipe, buf, n, &rd, NULL) || rd == 0)
+            break;
+        buf[rd] = 0;
+        /* Forward to asb_log (strip trailing newline) */
+        {
+            char *p = buf;
+            char *line_end;
+            while (*p) {
+                line_end = strchr(p, '\n');
+                if (line_end) *line_end = 0;
+                if (*p) asb_log(L"  %hs", p);
+                if (!line_end) break;
+                p = line_end + 1;
+            }
+        }
+        total += rd;
+    }
+
+    /* Drain any remaining output */
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0)
+            break;
+        DWORD n = avail > sizeof(buf) - 1 ? sizeof(buf) - 1 : avail;
+        DWORD rd = 0;
+        if (!ReadFile(hReadPipe, buf, n, &rd, NULL) || rd == 0)
+            break;
+        buf[rd] = 0;
+        { char *p = buf, *le; while (*p) { le = strchr(p, '\n'); if (le) *le = 0; if (*p) asb_log(L"  %hs", p); if (!le) break; p = le + 1; } }
+    }
+
     DWORD ec = 1;
     GetExitCodeProcess(pi.hProcess, &ec);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    CloseHandle(hReadPipe);
     return ec == 0 ? 0 : -1;
 }
 
@@ -2222,8 +2397,12 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         swprintf_s(args_buf, 2048,
             L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
             extras);
-        if (spawn_iso_patch_prefetch(args_buf) != 0)
-            asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
+        if (spawn_iso_patch_prefetch(args_buf) != 0) {
+            asb_log(L"Error: prefetch-repo failed — agent source missing, VM would be unusable.");
+            swprintf_s(args->error_msg, 512, L"prefetch-repo failed (GitHub download error)");
+            args->result = E_FAIL;
+            goto done;
+        }
 
         /* Prefetch 2: apt build-deps closure from archive.ubuntu.com.
            Needs (codename, kernel) detected from the ISO. */
@@ -2234,12 +2413,44 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                               kver,     ARRAYSIZE(kver)) == 0) {
             wchar_t apt_out[MAX_PATH];
             swprintf_s(apt_out, MAX_PATH, L"%s\\local-apt-extras", extras);
-            swprintf_s(args_buf, 2048,
-                L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
-                L"--out-dir \"%s\"",
-                codename, kver, apt_out);
-            if (spawn_iso_patch_prefetch(args_buf) != 0)
-                asb_log(L"WARN: prefetch-build-deps failed");
+            /* Try primary mirror first, then fallback mirrors */
+            const wchar_t *mirrors[] = {
+                NULL,  /* NULL = default (archive.ubuntu.com) */
+                L"http://mirrors.kernel.org/ubuntu",
+                L"http://us.archive.ubuntu.com/ubuntu",
+                NULL
+            };
+            BOOL build_deps_ok = FALSE;
+            int mi;
+            for (mi = 0; mirrors[mi] != NULL || mi == 0; mi++) {
+                if (mi > 0 && !mirrors[mi]) break;
+                if (mirrors[mi])
+                    asb_log(L"prefetch-build-deps: trying mirror %ls", mirrors[mi]);
+                if (mirrors[mi])
+                    swprintf_s(args_buf, 2048,
+                        L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
+                        L"--out-dir \"%s\" --mirror \"%s\"",
+                        codename, kver, apt_out, mirrors[mi]);
+                else
+                    swprintf_s(args_buf, 2048,
+                        L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
+                        L"--out-dir \"%s\"",
+                        codename, kver, apt_out);
+                if (spawn_iso_patch_prefetch(args_buf) == 0) {
+                    build_deps_ok = TRUE;
+                    break;
+                }
+                if (mirrors[mi])
+                    asb_log(L"prefetch-build-deps: mirror %ls failed, trying next...", mirrors[mi]);
+                else
+                    asb_log(L"prefetch-build-deps: primary mirror failed, trying fallback...");
+            }
+            if (!build_deps_ok) {
+                asb_log(L"Error: prefetch-build-deps failed on all mirrors - build tools missing.");
+                swprintf_s(args->error_msg, 512, L"prefetch-build-deps failed on all mirrors (SHA256 mismatch or network error). Retry in a few hours.");
+                args->result = E_FAIL;
+                goto done;
+            }
         } else {
             asb_log(L"WARN: could not detect ISO kernel — skipping build-deps");
         }
@@ -2643,6 +2854,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     }
     is_template_create = config->is_template;
     cfg.is_template = is_template_create;
+    if (config->storage_path && config->storage_path[0] != L'\0')
+        wcscpy_s(cfg.vhdx_base_dir, MAX_PATH, config->storage_path);
+    else
+        cfg.vhdx_base_dir[0] = L'\0';
 
     /* Defaults */
     if (cfg.hdd_gb == 0) cfg.hdd_gb = 64;
@@ -2741,23 +2956,70 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (cfg.admin_user[0] == L'\0')
         wcscpy_s(cfg.admin_user, 128, L"User");
 
-    /* Create VHDX directory */
+    /* Create VHDX directory — use custom storage path if specified,
+       otherwise fall back to %ProgramData%\AppSandbox. */
     {
         wchar_t base_dir[MAX_PATH];
-        if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
-            wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
-        swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox", base_dir);
-        CreateDirectoryW(vhdx_dir, NULL);
+        /* Templates always use the default path — scan_templates() and
+           asb_template_delete() are hardcoded to %ProgramData%\AppSandbox\
+           templates, so custom-path templates would be orphaned. */
+        if (is_template_create)
+            cfg.vhdx_base_dir[0] = L'\0';
 
-        if (is_template_create) {
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
-            CreateDirectoryW(vhdx_dir, NULL);
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, cfg.name);
+        if (cfg.vhdx_base_dir[0] != L'\0') {
+            /* User-specified storage path. Validate length: must fit MAX_PATH
+               for vhdx_path AND snapshot subpaths (\\snapshots\\<name>_<guid>.vhdx). */
+            size_t base_len = wcslen(cfg.vhdx_base_dir);
+            size_t name_len = wcslen(cfg.name);
+            if (base_len + name_len + 64 > MAX_PATH) {
+                asb_log(L"Error: Storage path too long (%zu chars + VM name).", base_len);
+                return E_INVALIDARG;
+            }
+            wcscpy_s(base_dir, MAX_PATH, cfg.vhdx_base_dir);
+            /* Strip trailing backslash to avoid double-backslash in paths */
+            {
+                size_t bl = wcslen(base_dir);
+                while (bl > 3 && base_dir[bl - 1] == L'\\') base_dir[--bl] = L'\0';
+            }
+            /* Recursively create the base directory (handles nested paths
+               like D:\VMs\AppSandbox where D:\VMs doesn't exist yet). */
+            {
+                DWORD dr = SHCreateDirectoryExW(NULL, base_dir, NULL);
+                if (dr != ERROR_SUCCESS && dr != ERROR_ALREADY_EXISTS) {
+                    asb_log(L"Error: Cannot create storage directory (0x%lx): %s", dr, base_dir);
+                    return E_INVALIDARG;
+                }
+            }
+
+            if (is_template_create) {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\templates\\%s", base_dir, cfg.name);
+            } else {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\%s", base_dir, cfg.name);
+            }
         } else {
-            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\%s", base_dir, cfg.name);
+            if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
+                wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
+            swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox", base_dir);
+            CreateDirectoryW(vhdx_dir, NULL);
+
+            if (is_template_create) {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates", base_dir);
+                CreateDirectoryW(vhdx_dir, NULL);
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\templates\\%s", base_dir, cfg.name);
+            } else {
+                swprintf_s(vhdx_dir, MAX_PATH, L"%s\\AppSandbox\\%s", base_dir, cfg.name);
+            }
         }
     }
-    CreateDirectoryW(vhdx_dir, NULL);
+    /* Use SHCreateDirectoryExW for the final VM dir to recursively create
+       any missing intermediate dirs (e.g. templates\ under custom paths). */
+    {
+        DWORD dr = SHCreateDirectoryExW(NULL, vhdx_dir, NULL);
+        if (dr != ERROR_SUCCESS && dr != ERROR_ALREADY_EXISTS) {
+            asb_log(L"Error: Cannot create VM directory (0x%lx): %s", dr, vhdx_dir);
+            return E_INVALIDARG;
+        }
+    }
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
 
     /* GPU driver shares */
@@ -3272,6 +3534,348 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     LeaveCriticalSection(&g_cs);
 
     save_vm_list();
+    return S_OK;
+}
+
+/* ---- VM import / export ---- */
+
+ASB_API HRESULT asb_vm_export(AsbVm vm, const wchar_t *target_dir)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    VmInstance *inst = &g_vms[idx];
+
+    if (inst->running) {
+        asb_log(L"Export error: VM \"%s\" is running. Stop it first.", inst->name);
+        return HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
+    }
+    if (!target_dir || !target_dir[0]) return E_INVALIDARG;
+
+    /* Create target_dir\<vm_name> */
+    wchar_t export_dir[MAX_PATH];
+    swprintf_s(export_dir, MAX_PATH, L"%s\\%s", target_dir, inst->name);
+    SHCreateDirectoryExW(NULL, export_dir, NULL);
+
+    /* Copy disk.vhdx */
+    wchar_t src_vhdx[MAX_PATH], dst_vhdx[MAX_PATH];
+    wcscpy_s(src_vhdx, MAX_PATH, inst->vhdx_path);
+    swprintf_s(dst_vhdx, MAX_PATH, L"%s\\disk.vhdx", export_dir);
+    asb_log(L"Export: copying %s -> %s ...", src_vhdx, dst_vhdx);
+    if (!CopyFileW(src_vhdx, dst_vhdx, FALSE)) {
+        asb_log(L"Export error: CopyFileW failed (%lu)", GetLastError());
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    /* Derive VM root directory from vhdx_path.
+     * For snapshot-free VMs: vhdx_path = ...\VM\disk.vhdx → root = ...\VM
+     * For snapshotted VMs: vhdx_path = ...\VM\snapshots\branch_xxx.vhdx
+     *   → strip filename → ...\VM\snapshots → strip \snapshots → ...\VM */
+    wchar_t vm_root[MAX_PATH];
+    wcscpy_s(vm_root, MAX_PATH, inst->vhdx_path);
+    {
+        wchar_t *slash = wcsrchr(vm_root, L'\\');
+        if (slash) *slash = L'\0';  /* strip filename */
+        size_t dlen = wcslen(vm_root);
+        if (dlen >= 10 && _wcsicmp(vm_root + dlen - 10, L"\\snapshots") == 0)
+            vm_root[dlen - 10] = L'\0';  /* strip \snapshots */
+    }
+
+    /* Copy snapshots directory if it exists */
+    {
+        wchar_t snap_dir[MAX_PATH];
+        swprintf_s(snap_dir, MAX_PATH, L"%s\\snapshots", vm_root);
+        if (GetFileAttributesW(snap_dir) != INVALID_FILE_ATTRIBUTES) {
+            wchar_t dst_snap[MAX_PATH];
+            swprintf_s(dst_snap, MAX_PATH, L"%s\\snapshots", export_dir);
+            asb_log(L"Export: copying snapshots ...");
+            copy_dir_recursive(snap_dir, dst_snap);
+        }
+    }
+
+    /* Copy state files */
+    {
+        wchar_t src_file[MAX_PATH], dst_file[MAX_PATH];
+        const wchar_t *files[] = { L"vm_state.json", L"language.json", NULL };
+        int fi;
+        for (fi = 0; files[fi]; fi++) {
+            swprintf_s(src_file, MAX_PATH, L"%s\\%s", vm_root, files[fi]);
+            if (GetFileAttributesW(src_file) != INVALID_FILE_ATTRIBUTES) {
+                swprintf_s(dst_file, MAX_PATH, L"%s\\%s", export_dir, files[fi]);
+                CopyFileW(src_file, dst_file, FALSE);
+            }
+        }
+    }
+
+    /* Write metadata file with full VM config for cross-machine import */
+    {
+        wchar_t meta_path[MAX_PATH];
+        swprintf_s(meta_path, MAX_PATH, L"%s\\vm_export.json", export_dir);
+        FILE *mf = NULL;
+        if (_wfopen_s(&mf, meta_path, L"w") == 0 && mf) {
+            char os_utf8[32];
+            WideCharToMultiByte(CP_UTF8, 0, inst->os_type, -1, os_utf8, sizeof(os_utf8), NULL, NULL);
+            char user_utf8[256];
+            WideCharToMultiByte(CP_UTF8, 0, inst->admin_user, -1, user_utf8, sizeof(user_utf8), NULL, NULL);
+            char root_utf8[MAX_PATH * 3];
+            WideCharToMultiByte(CP_UTF8, 0, vm_root, -1, root_utf8, sizeof(root_utf8), NULL, NULL);
+            fprintf(mf, "{\"osType\":\"%s\",\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,"
+                         "\"gpuMode\":%d,\"networkMode\":%d,\"testMode\":%d,"
+                         "\"sshEnabled\":%d,\"adminUser\":\"%s\",\"vmRoot\":\"%s\"}\n",
+                os_utf8, inst->ram_mb, inst->hdd_gb, inst->cpu_cores,
+                inst->gpu_mode, inst->network_mode, inst->test_mode ? 1 : 0,
+                inst->ssh_enabled ? 1 : 0, user_utf8, root_utf8);
+            fclose(mf);
+        }
+    }
+
+    asb_log(L"Export complete: %s", export_dir);
+    return S_OK;
+}
+
+ASB_API HRESULT asb_vm_import(const wchar_t *source_vhdx,
+                               const wchar_t *vm_name,
+                               const wchar_t *os_type,
+                               const wchar_t *storage_path)
+{
+    wchar_t vhdx_dir[MAX_PATH], base_dir[MAX_PATH], src_dir[MAX_PATH];
+    VmInstance *inst;
+    int i;
+
+    if (!source_vhdx || !vm_name || !vm_name[0])
+        return E_INVALIDARG;
+    if (GetFileAttributesW(source_vhdx) == INVALID_FILE_ATTRIBUTES) {
+        asb_log(L"Import error: source VHDX not found: %s", source_vhdx);
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
+
+    /* Validate VM name: reject path traversal and illegal filesystem characters */
+    {
+        const wchar_t *p;
+        for (p = vm_name; *p; p++) {
+            if (*p == L'\\' || *p == L'/' || *p == L'.' && p[1] == L'.') {
+                asb_log(L"Import error: VM name contains path separator or traversal.");
+                return E_INVALIDARG;
+            }
+        }
+        if (wcslen(vm_name) > 128) {
+            asb_log(L"Import error: VM name too long (max 128 chars).");
+            return E_INVALIDARG;
+        }
+    }
+
+    /* Derive source directory from source_vhdx path */
+    wcscpy_s(src_dir, MAX_PATH, source_vhdx);
+    {
+        wchar_t *slash = wcsrchr(src_dir, L'\\');
+        if (slash) *slash = L'\0';
+    }
+
+    /* Thread-safe duplicate check and slot reservation */
+    EnterCriticalSection(&g_cs);
+    for (i = 0; i < g_vm_count; i++) {
+        if (_wcsicmp(g_vms[i].name, vm_name) == 0) {
+            LeaveCriticalSection(&g_cs);
+            asb_log(L"Import error: VM \"%s\" already exists.", vm_name);
+            return E_INVALIDARG;
+        }
+    }
+    if (g_vm_count >= ASB_MAX_VMS) {
+        LeaveCriticalSection(&g_cs);
+        return E_OUTOFMEMORY;
+    }
+    /* Reserve the slot atomically */
+    inst = &g_vms[g_vm_count];
+    ZeroMemory(inst, sizeof(VmInstance));
+    g_vm_count++;  /* claim the slot now — visible to other threads */
+    LeaveCriticalSection(&g_cs);
+
+    /* Determine storage path */
+    if (storage_path && storage_path[0] != L'\0') {
+        size_t bl = wcslen(storage_path);
+        while (bl > 3 && storage_path[bl-1] == L'\\') bl--;
+        if (bl + wcslen(vm_name) + 64 > MAX_PATH) {
+            asb_log(L"Import error: storage path too long.");
+            return E_INVALIDARG;
+        }
+        wcsncpy_s(base_dir, MAX_PATH, storage_path, _TRUNCATE);
+        base_dir[bl] = L'\0';
+    } else {
+        if (!GetEnvironmentVariableW(L"ProgramData", base_dir, MAX_PATH))
+            wcscpy_s(base_dir, MAX_PATH, L"C:\\ProgramData");
+        /* Append \AppSandbox to match the standard VM storage convention */
+        swprintf_s(base_dir + wcslen(base_dir), MAX_PATH - wcslen(base_dir),
+                    L"\\AppSandbox");
+    }
+
+    /* Create directories */
+    {
+        DWORD dr = SHCreateDirectoryExW(NULL, base_dir, NULL);
+        if (dr != ERROR_SUCCESS && dr != ERROR_ALREADY_EXISTS) {
+            asb_log(L"Import error: cannot create base directory (0x%lx)", dr);
+            return E_INVALIDARG;
+        }
+    }
+    swprintf_s(vhdx_dir, MAX_PATH, L"%s\\%s", base_dir, vm_name);
+    {
+        DWORD dr = SHCreateDirectoryExW(NULL, vhdx_dir, NULL);
+        if (dr != ERROR_SUCCESS && dr != ERROR_ALREADY_EXISTS) {
+            asb_log(L"Import error: cannot create VM directory (0x%lx)", dr);
+            return E_INVALIDARG;
+        }
+    }
+
+    /* Copy the VHDX */
+    wchar_t dst_vhdx[MAX_PATH];
+    swprintf_s(dst_vhdx, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
+    asb_log(L"Import: copying %s -> %s ...", source_vhdx, dst_vhdx);
+    if (!CopyFileW(source_vhdx, dst_vhdx, FALSE)) {
+        asb_log(L"Import error: CopyFileW failed (%lu)", GetLastError());
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    /* Copy state files (vm_state.json, language.json) from source directory */
+    {
+        const wchar_t *files[] = { L"vm_state.json", L"language.json", NULL };
+        int fi;
+        for (fi = 0; files[fi]; fi++) {
+            wchar_t src_file[MAX_PATH], dst_file[MAX_PATH];
+            swprintf_s(src_file, MAX_PATH, L"%s\\%s", src_dir, files[fi]);
+            if (GetFileAttributesW(src_file) != INVALID_FILE_ATTRIBUTES) {
+                swprintf_s(dst_file, MAX_PATH, L"%s\\%s", vhdx_dir, files[fi]);
+                CopyFileW(src_file, dst_file, FALSE);
+            }
+        }
+    }
+
+    /* Read export metadata FIRST (needed for tree.dat path rewrite) */
+    wchar_t meta_os[32] = {0}, meta_user[128] = {0}, meta_root[MAX_PATH] = {0};
+    int meta_ram = 0, meta_hdd = 0, meta_cpu = 0, meta_gpu = 0, meta_net = -1;
+    int meta_test = 0, meta_ssh = 0;
+    {
+        wchar_t meta_path[MAX_PATH];
+        swprintf_s(meta_path, MAX_PATH, L"%s\\vm_export.json", src_dir);
+        FILE *mf = NULL;
+        if (_wfopen_s(&mf, meta_path, L"r") == 0 && mf) {
+            char buf[2048];
+            size_t nread = fread(buf, 1, sizeof(buf) - 1, mf);
+            buf[nread] = 0;
+            fclose(mf);
+            { char *p; if ((p = strstr(buf, "\"osType\":\""))) { p += 10; char *e = strchr(p, '"'); if (e) { size_t l = e - p; if (l < 32) { MultiByteToWideChar(CP_UTF8, 0, p, (int)l, meta_os, 32); meta_os[l] = 0; } } } }
+            { char *p; if ((p = strstr(buf, "\"ramMb\":"))) meta_ram = atoi(p + 8); }
+            { char *p; if ((p = strstr(buf, "\"hddGb\":"))) meta_hdd = atoi(p + 8); }
+            { char *p; if ((p = strstr(buf, "\"cpuCores\":"))) meta_cpu = atoi(p + 11); }
+            { char *p; if ((p = strstr(buf, "\"gpuMode\":"))) meta_gpu = atoi(p + 10); }
+            { char *p; if ((p = strstr(buf, "\"networkMode\":"))) meta_net = atoi(p + 14); }
+            { char *p; if ((p = strstr(buf, "\"testMode\":"))) meta_test = atoi(p + 11); }
+            { char *p; if ((p = strstr(buf, "\"sshEnabled\":"))) meta_ssh = atoi(p + 13); }
+            { char *p; if ((p = strstr(buf, "\"adminUser\":\""))) { p += 13; char *e = strchr(p, '"'); if (e) { size_t l = e - p; if (l < 128) { MultiByteToWideChar(CP_UTF8, 0, p, (int)l, meta_user, 128); meta_user[l] = 0; } } } }
+            { char *p; if ((p = strstr(buf, "\"vmRoot\":\""))) { p += 10; char *e = strchr(p, '"'); if (e) { size_t l = e - p; if (l < MAX_PATH) { MultiByteToWideChar(CP_UTF8, 0, p, (int)l, meta_root, MAX_PATH); meta_root[l] = 0; } } } }
+            asb_log(L"Import: read metadata from vm_export.json");
+        }
+    }
+
+    /* Copy snapshots directory if it exists alongside the source */
+    {
+        wchar_t snap_src[MAX_PATH], snap_dst[MAX_PATH];
+        swprintf_s(snap_src, MAX_PATH, L"%s\\snapshots", src_dir);
+        if (GetFileAttributesW(snap_src) != INVALID_FILE_ATTRIBUTES) {
+            swprintf_s(snap_dst, MAX_PATH, L"%s\\snapshots", vhdx_dir);
+            asb_log(L"Import: copying snapshots ...");
+            copy_dir_recursive(snap_src, snap_dst);
+            /* Rewrite tree.dat paths: replace original vmRoot with new vhdx_dir.
+             * Uses safe line-by-line approach (no in-place memmove). */
+            {
+                wchar_t tree_path[MAX_PATH];
+                swprintf_s(tree_path, MAX_PATH, L"%s\\tree.dat", snap_dst);
+                /* Only rewrite if we know the original root path */
+                if (meta_root[0]) {
+                    char old_path[MAX_PATH * 3], new_path[MAX_PATH * 3];
+                    WideCharToMultiByte(CP_UTF8, 0, meta_root, -1,
+                                        old_path, sizeof(old_path), NULL, NULL);
+                    WideCharToMultiByte(CP_UTF8, 0, vhdx_dir, -1,
+                                        new_path, sizeof(new_path), NULL, NULL);
+                    size_t old_len = strlen(old_path);
+                    size_t new_len = strlen(new_path);
+                    FILE *tf = NULL;
+                    if (_wfopen_s(&tf, tree_path, L"r") == 0 && tf) {
+                        /* Write to a temp file, then rename */
+                        wchar_t tmp_path[MAX_PATH];
+                        swprintf_s(tmp_path, MAX_PATH, L"%s.tmp", tree_path);
+                        FILE *of = NULL;
+                        if (_wfopen_s(&of, tmp_path, L"w") == 0 && of) {
+                            char line[2048];
+                            while (fgets(line, sizeof(line), tf)) {
+                                /* Replace all occurrences of old_path in this line */
+                                char *p = line;
+                                char out[4096];
+                                size_t out_len = 0;
+                                while (*p) {
+                                    if (strncmp(p, old_path, old_len) == 0) {
+                                        memcpy(out + out_len, new_path, new_len);
+                                        out_len += new_len;
+                                        p += old_len;
+                                    } else {
+                                        out[out_len++] = *p++;
+                                    }
+                                }
+                                fwrite(out, 1, out_len, of);
+                            }
+                            fclose(of);
+                            fclose(tf);
+                            /* Replace original with rewritten */
+                            DeleteFileW(tree_path);
+                            MoveFileExW(tmp_path, tree_path, MOVEFILE_REPLACE_EXISTING);
+                            asb_log(L"Import: rewrote snapshot paths in tree.dat");
+                        } else {
+                            fclose(tf);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Apply config from metadata */
+    if (os_type && os_type[0])
+        wcscpy_s(inst->os_type, 32, os_type);
+    else if (meta_os[0])
+        wcscpy_s(inst->os_type, 32, meta_os);
+    else
+        wcscpy_s(inst->os_type, 32, L"Windows");
+    inst->ram_mb = meta_ram > 0 ? meta_ram : 4096;
+    inst->hdd_gb = meta_hdd > 0 ? meta_hdd : 64;
+    inst->cpu_cores = meta_cpu > 0 ? meta_cpu : 4;
+    inst->gpu_mode = meta_gpu;
+    /* network_mode: -1 means metadata not found → default NAT; 0 = NET_NONE is valid */
+    inst->network_mode = (meta_net >= 0) ? meta_net : 1;
+    if (meta_test)
+        inst->test_mode = TRUE;
+    else if (_wcsicmp(inst->os_type, L"Linux") == 0)
+        inst->test_mode = TRUE;
+    inst->ssh_enabled = meta_ssh ? TRUE : FALSE;
+    if (meta_user[0])
+        wcscpy_s(inst->admin_user, 128, meta_user);
+    else
+        wcscpy_s(inst->admin_user, 128, L"User");
+
+    inst->unique_id = g_next_vm_id++;
+    wcscpy_s(inst->name, 256, vm_name);
+    wcscpy_s(inst->vhdx_path, MAX_PATH, dst_vhdx);
+    inst->install_complete = vm_load_state_json(dst_vhdx);
+
+    /* Initialize snapshot tree */
+    {
+        wchar_t snap_dir[MAX_PATH];
+        swprintf_s(snap_dir, MAX_PATH, L"%s\\snapshots", vhdx_dir);
+        snapshot_init(&g_snap_trees[g_vm_count - 1], snap_dir);  /* g_vm_count already incremented */
+    }
+
+    EnterCriticalSection(&g_cs);
+    save_vm_list();
+    LeaveCriticalSection(&g_cs);
+
+    asb_log(L"Import complete: VM \"%s\" (os=%s, vhdx=%s)",
+            vm_name, inst->os_type, dst_vhdx);
     return S_OK;
 }
 

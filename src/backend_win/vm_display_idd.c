@@ -103,7 +103,7 @@ typedef struct AudioFrameHeader {
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+#define MAX_FRAME_DATA_SIZE (7680 * 4320 * 4)  /* max supported resolution BGRA */
 
 /* ---- Input protocol (host → guest) ---- */
 
@@ -112,6 +112,7 @@ typedef struct AudioFrameHeader {
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_SET_DIMENSIONS 4  /* host tells guest the current frame dimensions */
 
 /* Button IDs for INPUT_MOUSE_BUTTON */
 #define INPUT_BTN_LEFT      0
@@ -138,7 +139,7 @@ typedef struct InputPacket {
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
-#define PRESENT_MS      16   /* ~60 fps */
+#define PRESENT_MS      4    /* ~250 Hz timer; frame_dirty gates actual renders */
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -218,6 +219,9 @@ struct VmDisplayIdd {
     ID3D11RenderTargetView  *rtv;
     ID3D11Texture2D         *frame_tex;
     ID3D11ShaderResourceView *frame_srv;
+    UINT           frame_tex_width;   /* current GPU texture width (may differ from frame_width during resize) */
+    UINT           frame_tex_height;  /* current GPU texture height */
+    UINT           target_refresh;    /* target refresh rate in Hz for present timer */
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
@@ -267,6 +271,10 @@ struct VmDisplayIdd {
     volatile SOCKET  audio_socket;
     HANDLE           audio_recv_thread;
     volatile BOOL    audio_muted;
+
+    /* Dynamic resolution: suppresses auto-resize while waiting for guest
+     * to acknowledge a host-initiated resolution change. */
+    volatile BOOL    resolution_pending;
 
     /* Threads */
     HANDLE         recv_thread;
@@ -529,9 +537,9 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     /* Log non-move events only (moves are too noisy) */
     if (type != INPUT_MOUSE_MOVE) {
         static const wchar_t *type_names[] = {
-            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY"
+            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY", L"SET_DIMS"
         };
-        const wchar_t *name = type < 4 ? type_names[type] : L"?";
+        const wchar_t *name = type < 5 ? type_names[type] : L"?";
         idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
     }
 }
@@ -1063,7 +1071,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
     scd.BufferDesc.Width                   = DEFAULT_WIDTH;
     scd.BufferDesc.Height                  = DEFAULT_HEIGHT;
     scd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
-    scd.BufferDesc.RefreshRate.Numerator   = 60;
+    scd.BufferDesc.RefreshRate.Numerator   = d->target_refresh ? d->target_refresh : 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
     scd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.OutputWindow                       = d->render_hwnd;
@@ -1175,6 +1183,57 @@ static BOOL d3d_init(VmDisplayIdd *d)
     return TRUE;
 }
 
+/* Recreate the GPU frame texture + SRV when the guest resolution changes.
+ * Must be called from the window thread (D3D11 device context thread).
+ * Caller must NOT hold frame_cs. */
+static void d3d_recreate_frame_texture(VmDisplayIdd *d, UINT width, UINT height)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    HRESULT hr;
+
+    if (!d->device) return;
+    if (width == d->frame_tex_width && height == d->frame_tex_height) return;
+
+    /* Release old texture + SRV */
+    if (d->frame_srv) { d->frame_srv->lpVtbl->Release(d->frame_srv); d->frame_srv = NULL; }
+    if (d->frame_tex) { d->frame_tex->lpVtbl->Release(d->frame_tex); d->frame_tex = NULL; }
+
+    ZeroMemory(&td, sizeof(td));
+    td.Width              = width;
+    td.Height             = height;
+    td.MipLevels          = 1;
+    td.ArraySize          = 1;
+    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count   = 1;
+    td.Usage              = D3D11_USAGE_DYNAMIC;
+    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
+
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateTexture2D (resize) failed (0x%08X)", hr);
+        return;
+    }
+
+    ZeroMemory(&srv_desc, sizeof(srv_desc));
+    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels       = 1;
+    srv_desc.Texture2D.MostDetailedMip  = 0;
+
+    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
+            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateShaderResourceView (resize) failed (0x%08X)", hr);
+        return;
+    }
+
+    d->frame_tex_width  = width;
+    d->frame_tex_height = height;
+    idd_log(d, L"D3D texture recreated: %ux%u", width, height);
+}
+
 static void d3d_resize_swap_chain(VmDisplayIdd *d)
 {
     RECT rc;
@@ -1224,8 +1283,29 @@ static void d3d_render_frame(VmDisplayIdd *d)
     if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
         return;
 
-    /* Upload frame data to GPU texture if dirty */
-    if (d->frame_dirty) {
+    /* If guest resolution changed, recreate GPU texture AND resize window.
+     * Both must happen in the same block — checking after texture recreation
+     * would miss the change (frame_tex_width is updated by recreate). */
+    if (d->frame_dirty && d->device &&
+        (d->frame_width != d->frame_tex_width || d->frame_height != d->frame_tex_height)) {
+        d3d_recreate_frame_texture(d, d->frame_width, d->frame_height);
+
+        /* Auto-resize window to match guest resolution — but only if the
+         * resize wasn't host-initiated (resolution_pending suppresses this
+         * to avoid a feedback loop while waiting for the guest to ack). */
+        if (d->hwnd && !d->resolution_pending) {
+            DWORD style = (DWORD)GetWindowLongW(d->hwnd, GWL_STYLE);
+            DWORD exstyle = (DWORD)GetWindowLongW(d->hwnd, GWL_EXSTYLE);
+            RECT wr = { 0, 0, (LONG)d->frame_width, (LONG)d->frame_height };
+            AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+            SetWindowPos(d->hwnd, NULL, 0, 0,
+                         wr.right - wr.left, wr.bottom - wr.top,
+                         SWP_NOMOVE | SWP_NOZORDER);
+        }
+        /* Guest acknowledged the resolution change — clear pending flag */
+        d->resolution_pending = FALSE;
+    }
+    if (d->frame_dirty && d->frame_tex) {
         EnterCriticalSection(&d->frame_cs);
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
@@ -1238,7 +1318,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (copy_stride > d->frame_stride)
                 copy_stride = d->frame_stride;
 
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
+            for (row = 0; row < d->frame_height && row < d->frame_tex_height; row++) {
                 memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
                        d->frame_buf + row * d->frame_stride,
                        copy_stride);
@@ -1561,6 +1641,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->input_socket = input_s;
                     g_input_send_count = 0;
                     idd_log(d, L"Input connected + ready (GUID :0003).");
+                    /* Send current frame dimensions so mouse mapping is correct
+                     * from the very first input event. */
+                    if (d->frame_width > 0 && d->frame_height > 0)
+                        send_input(d, INPUT_SET_DIMENSIONS, d->frame_width, d->frame_height, 0);
                 } else {
                     idd_log(d, L"Input handshake failed - closing.");
                     closesocket(input_s);
@@ -1728,6 +1812,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
                             hdr.width, hdr.height, hdr.stride);
                     idd_log(d, L"Resolution changed to %ux%u.", hdr.width, hdr.height);
+                    /* Notify guest input handler of new frame dimensions
+                     * so mouse coordinate scaling is correct. */
+                    send_input(d, INPUT_SET_DIMENSIONS, hdr.width, hdr.height, 0);
                 } else {
                     LeaveCriticalSection(&d->frame_cs);
                     break;
@@ -1875,11 +1962,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
-    /* Compute outer window size so the client area is exactly 1920x1080 */
+    /* Compute outer window size so the client area is exactly DEFAULT_WIDTH x DEFAULT_HEIGHT */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
+        /* Window is resizable: user can resize/maximize and the guest
+         * resolution will follow via WM_EXITSIZEMOVE -> set_resolution. */
         DWORD exstyle = 0;
-        RECT wr = { 0, 0, 1920, 1080 };
+        RECT wr = { 0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT };
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
 
         d->hwnd = CreateWindowExW(
@@ -1994,7 +2083,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     }
 
     /* Start a present timer for steady rendering */
-    SetTimer(d->hwnd, IDT_PRESENT, PRESENT_MS, NULL);
+    SetTimer(d->hwnd, IDT_PRESENT,
+             d->target_refresh > 0 ? (1000 / d->target_refresh) : PRESENT_MS, NULL);
 
     /* Install the hotkey hook on this (message-pumping) thread if the
        persisted setting has Transmit mode enabled. */
@@ -2162,14 +2252,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
-        /* Max: native frame size */
-        if (d && d->frame_width > 0 && d->frame_height > 0) {
-            wr.left = 0; wr.top = 0;
-            wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
-            AdjustWindowRectEx(&wr, style, FALSE, exstyle);
-            mmi->ptMaxTrackSize.x = wr.right - wr.left;
-            mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
-        }
+        /* No max track size restriction — user can resize freely.
+         * Guest resolution follows via WM_EXITSIZEMOVE. */
         return 0;
     }
 
@@ -2191,6 +2275,29 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         EndPaint(hwnd, &ps);
         return 0;
     }
+
+    case WM_EXITSIZEMOVE:
+        /* User finished resizing or maximizing. Send the new client-area
+         * dimensions to the guest so it can switch its display resolution
+         * to match. The guest agent writes to asb_drm's sysfs, which fires
+         * a hotplug event, and Mutter switches to the new preferred mode. */
+        if (d && d->vm) {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            if (rc.right > 0 && rc.bottom > 0) {
+                char cmd[64];
+                int n = _snprintf_s(cmd, sizeof(cmd), _TRUNCATE,
+                                    "set_resolution:%ux%u",
+                                    (unsigned)rc.right, (unsigned)rc.bottom);
+                if (n > 0) {
+                    d->resolution_pending = TRUE;
+                    vm_agent_send(d->vm, cmd, NULL, 0, 5000);
+                    idd_log(d, L"WM_EXITSIZEMOVE: requested guest resolution %ux%u",
+                            (unsigned)rc.right, (unsigned)rc.bottom);
+                }
+            }
+        }
+        return 0;
 
     case WM_TIMER:
         if (wp == IDT_PRESENT && d) {
@@ -2391,6 +2498,18 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->frame_width  = DEFAULT_WIDTH;
     d->frame_height = DEFAULT_HEIGHT;
     d->frame_stride = DEFAULT_WIDTH * 4;
+    d->frame_tex_width  = DEFAULT_WIDTH;
+    d->frame_tex_height = DEFAULT_HEIGHT;
+    /* Detect host display refresh rate for adaptive present timer */
+    {
+        DEVMODEW dm;
+        ZeroMemory(&dm, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+            d->target_refresh = (dm.dmDisplayFrequency > 144) ? 144 : dm.dmDisplayFrequency;
+        else
+            d->target_refresh = 60;
+    }
     d->frame_buf    = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                          d->frame_stride * d->frame_height);
     if (!d->frame_buf) {

@@ -212,7 +212,7 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
     {
         wchar_t path[1024];
         swprintf_s(path, 1024,
-            L"/jamesstringer90/appsandbox/tar.gz/refs/heads/%s", branch);
+            L"/HeeneFZ/appsandbox/tar.gz/refs/heads/%s", branch);
         log_msg(L"prefetch-repo: GET https://codeload.github.com%s", path);
         if (http_download_secure(L"codeload.github.com", 443, path, tgz) != 0) {
             log_err(L"prefetch-repo: download failed");

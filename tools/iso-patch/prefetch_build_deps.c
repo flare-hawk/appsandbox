@@ -815,8 +815,13 @@ int do_prefetch_build_deps(const wchar_t *codename,
                 return -1;
             }
             if (_stricmp(actual, sha_utf8) != 0) {
-                log_err(L"prefetch: SHA256 mismatch for %ls (got %hs, want %hs)",
-                        basename, actual, sha_utf8);
+                log_err(L"prefetch: SHA256 mismatch for %ls", basename);
+                log_err(L"prefetch:   got    %hs", actual);
+                log_err(L"prefetch:   expect %hs", sha_utf8);
+                log_err(L"prefetch:   url    %ls", url2);
+                log_err(L"prefetch: archive.ubuntu.com index/package out of sync.");
+                log_err(L"prefetch: This is a temporary server-side issue. Please retry in a few hours.");
+                DeleteFileW(dst);
                 return -1;
             }
         }

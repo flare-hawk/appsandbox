@@ -47,6 +47,7 @@
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_SET_DIMENSIONS 4  /* host tells us current frame dimensions */
 
 #define BTN_ID_LEFT         0
 #define BTN_ID_RIGHT        1
@@ -335,7 +336,12 @@ static void serve(int client_fd, int ui_fd)
         switch (pkt.type) {
         case INPUT_MOUSE_MOVE:   do_mouse_move(ui_fd, pkt.p1, pkt.p2); break;
         case INPUT_MOUSE_BUTTON: do_mouse_button(ui_fd, pkt.p1, pkt.p2); break;
-        case INPUT_MOUSE_WHEEL:  do_mouse_wheel(ui_fd, (int32_t)pkt.p1); break;
+        case INPUT_SET_DIMENSIONS:
+            if (pkt.p1 > 0 && pkt.p2 > 0) {
+                g_frame_w = (int)pkt.p1;
+                g_frame_h = (int)pkt.p2;
+            }
+            break;
         case INPUT_KEY:          do_key(ui_fd, pkt.p1, pkt.p2, pkt.p3); break;
         default: break;
         }

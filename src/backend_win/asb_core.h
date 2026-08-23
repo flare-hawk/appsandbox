@@ -62,6 +62,7 @@ typedef struct {
     BOOL   ssh_enabled;            /* TRUE = install OpenSSH Server in guest */
     BOOL   ssh_deploy_key;         /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL   is_template;            /* TRUE = create as template VM */
+    const wchar_t *storage_path;   /* custom storage directory, or NULL for default */
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -143,6 +144,24 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm);
 
 /* Stop VM (if running) and delete all files, snapshots, and directories. */
 ASB_API HRESULT asb_vm_delete(AsbVm vm);
+
+/* ---- VM import / export ---- */
+
+/* Export a stopped VM's disk + snapshots to a directory.
+   target_dir: destination folder (a subdirectory named after the VM will be created).
+   Returns S_OK on success. VM must be stopped. */
+ASB_API HRESULT asb_vm_export(AsbVm vm, const wchar_t *target_dir);
+
+/* Import a VHDX file as a new VM. Copies the VHDX to the storage path
+   and registers it in vms.cfg. Also copies snapshots/ if present.
+   source_vhdx: path to the .vhdx file to import.
+   vm_name: new VM name (must be unique).
+   os_type: "Windows" or "Linux" (NULL = auto-detect from VHDX directory).
+   storage_path: custom storage dir, or NULL for default (%ProgramData%\AppSandbox). */
+ASB_API HRESULT asb_vm_import(const wchar_t *source_vhdx,
+                               const wchar_t *vm_name,
+                               const wchar_t *os_type,
+                               const wchar_t *storage_path);
 
 /* ---- VM queries ---- */
 

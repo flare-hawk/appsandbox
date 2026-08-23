@@ -16,6 +16,7 @@
     <div class="section-header">
         <h2>Sandboxes</h2>
         <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+        <button id="btn-import-sandbox" onclick="onImportVm()">Import</button>
     </div>
     <div class="vm-table-wrap">
         <table id="vm-table">
@@ -36,6 +37,7 @@
                 <th class="icon-col">&#x23FB;</th>
                 <th class="icon-col">&#x2715;&#xFE0F;</th>
                 <th class="icon-col">&#x1F5D1;&#xFE0F;</th>
+                <th class="icon-col" title="Export">&#x1F4E4;</th>
                 <th class="icon-col">&#x270F;&#xFE0F;</th>
             </tr></thead>
             <tbody id="vm-tbody"></tbody>
@@ -100,6 +102,12 @@
                     <option value="ubuntu-26.04" selected>Ubuntu 26.04 LTS</option>
                 </select>
                 <span class="host-info">Downloaded on first create (~600 MB), cached on the host</span>
+            </div>
+
+            <label for="storage-path">Storage Path:</label>
+            <div class="form-row">
+                <input type="text" id="storage-path" maxlength="190" placeholder="Default (C:\ProgramData\AppSandbox)" autocorrect="off" autocapitalize="off" spellcheck="false" class="input-md">
+                <button id="btn-browse-storage" onclick="sendCmd('browseStorage')">Browse...</button>
             </div>
 
             <label for="hdd-size">HDD Size:</label>

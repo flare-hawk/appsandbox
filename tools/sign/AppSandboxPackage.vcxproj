@@ -39,12 +39,12 @@
   <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
     <ConfigurationType>Utility</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>v145</PlatformToolset>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
     <ConfigurationType>Utility</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>v145</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
@@ -53,8 +53,7 @@
     <!-- Always run on a Release build (no stale up-to-date skip). -->
     <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
   </PropertyGroup>
-  <Target Name="AppSandboxSignAndPackage" AfterTargets="Build"
-          Condition="'$(Configuration)'=='Release' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64') And '$(ASB_SKIP_PACKAGE_PROJECT)' != '1'">
+  <Target Name="AppSandboxSignAndPackage" AfterTargets="Build" Condition="'$(Configuration)'=='Release' And ('$(Platform)'=='x64' Or '$(Platform)'=='ARM64') And '$(ASB_SKIP_PACKAGE_PROJECT)' != '1'">
     <Message Importance="high" Text="==== AppSandbox: make-release.ps1 -NoBuild -Platform $(Platform) (sign + package) ====" />
     <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)tools\sign\make-release.ps1&quot; -NoBuild -Platform $(Platform)" />
   </Target>

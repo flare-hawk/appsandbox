@@ -142,6 +142,9 @@ window.onHostMessage = function(msg) {
         case 'log':           appendLog(msg.message); break;
         case 'hostInfo':      updateHostInfo(msg); break;
         case 'browseResult':  onBrowseResult(msg.path); break;
+        case 'browseStorageResult': onBrowseStorageResult(msg.path); break;
+        case 'exportResult':  if (msg.result === 'ok') logMsg('VM exported successfully.'); else logMsg('Export failed.'); break;
+        case 'importResult':  if (msg.result === 'ok') logMsg('VM imported successfully.'); else logMsg('Import failed.'); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
@@ -342,6 +345,12 @@ function onBrowseResult(path) {
     }
 }
 
+function onBrowseStorageResult(path) {
+    if (path) {
+        document.getElementById('storage-path').value = path;
+    }
+}
+
 /* ---- Create buttons state ---- */
 
 function updateCreateButtons() {
@@ -452,7 +461,8 @@ function gatherConfig() {
         adminConfirm: document.getElementById('admin-confirm').value,
         testMode:    document.getElementById('test-mode').checked,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
-        sshDeployKey: document.getElementById('ssh-deploy-key').checked
+        sshDeployKey: document.getElementById('ssh-deploy-key').checked,
+        storagePath:  document.getElementById('storage-path').value.trim()
     };
 }
 
@@ -469,6 +479,7 @@ function clearCreateForm() {
     document.getElementById('image-path').value = '';
     selectTemplate('', templateDefaultLabel());
     updateCreateButtons();
+    document.getElementById('storage-path').value = '';
 }
 
 /* VM name / hostname validation. Per-guest-OS rules, keyed off the
@@ -615,6 +626,14 @@ function openCreateModal() {
 
 function closeCreateModal() {
     document.getElementById('create-vm-overlay').classList.remove('active');
+}
+
+function onImportVm() {
+    sendCmd('importVm', {});
+}
+
+function onExportVm(vmIndex) {
+    sendCmd('exportVm', { vmIndex: vmIndex });
 }
 
 /* Close on backdrop click — but only when the press also STARTED on the backdrop.
@@ -775,6 +794,7 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
+        makeIconCell('export', '\uD83D\uDCE4', !vm.running && !bld, function() { onExportVm(i); }, '', 'Export this VM to a folder (copy VHDX + snapshots)'),
         makeIconCell('edit', editModeRow === i ? '\u2714\uFE0F' : '\u270F\uFE0F', !vm.running && !bld, function() { toggleEditMode(i); }, '', 'Edit VM configuration (CPU, RAM, GPU, network) — VM must be stopped'),
     );
     return cells;

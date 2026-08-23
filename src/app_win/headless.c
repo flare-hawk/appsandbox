@@ -643,6 +643,7 @@ static int handle_request(PHTTP_REQUEST req)
             AsbVmConfig cfg; int iv; BOOL bv;
             wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, tpl[256]={0};
             wchar_t user[128]={0}, pass[128]={0}, adapter[256]={0};
+            wchar_t storage[MAX_PATH]={0};
             char nu[256]={0};
             body_to_wide(req, body, 8192);
             ZeroMemory(&cfg, sizeof(cfg));
@@ -653,10 +654,12 @@ static int handle_request(PHTTP_REQUEST req)
             json_get_string(body, L"adminUser", user, 128);
             json_get_string(body, L"adminPass", pass, 128);
             json_get_string(body, L"netAdapter", adapter, 256);
+            json_get_string(body, L"storagePath", storage, MAX_PATH);
             trim_ws(name); trim_ws(user);   /* match the GUI's .value.trim() */
             cfg.name = name; cfg.os_type = os; cfg.image_path = img;
             cfg.template_name = tpl; cfg.username = user; cfg.password = pass;
             cfg.net_adapter = adapter;
+            cfg.storage_path = storage[0] ? storage : NULL;
             if (json_get_int(body, L"ramMb", &iv)) cfg.ram_mb = (DWORD)iv;
             if (json_get_int(body, L"hddGb", &iv)) cfg.hdd_gb = (DWORD)iv;
             if (json_get_int(body, L"cpuCores", &iv)) cfg.cpu_cores = (DWORD)iv;
@@ -686,6 +689,24 @@ static int handle_request(PHTTP_REQUEST req)
             }
             return 0;
         }
+    }
+
+    /* ---- /v1/vms/import (POST) ---- */
+    if (verb == HttpVerbPOST && wcscmp(path, L"/v1/vms/import") == 0) {
+        wchar_t body[4096];
+        wchar_t vhdx_path[MAX_PATH]={0}, vm_name[256]={0}, os_type[32]={0}, storage[MAX_PATH]={0};
+        body_to_wide(req, body, 4096);
+        json_get_string(body, L"vhdxPath", vhdx_path, MAX_PATH);
+        json_get_string(body, L"name", vm_name, 256);
+        json_get_string(body, L"osType", os_type, 32);
+        json_get_string(body, L"storagePath", storage, MAX_PATH);
+        {
+            HRESULT hr = asb_vm_import(vhdx_path, vm_name,
+                                        os_type[0] ? os_type : NULL,
+                                        storage[0] ? storage : NULL);
+            send_hr(req->RequestId, "importVm", "", hr);
+        }
+        return 0;
     }
 
     /* ---- /v1/vms/{name}[/sub] ---- */
@@ -795,6 +816,13 @@ static int handle_request(PHTTP_REQUEST req)
             }
             if (dv) display_drop(display_find(dv->unique_id));   /* close its display window first */
             send_hr(req->RequestId, "delete", nu, asb_vm_delete(vm));
+            return 0;
+        }
+        if (verb == HttpVerbPOST && wcscmp(sub, L"export") == 0) {
+            wchar_t body[1024], target_dir[MAX_PATH] = {0};
+            body_to_wide(req, body, 1024);
+            json_get_string(body, L"targetDir", target_dir, MAX_PATH);
+            send_hr(req->RequestId, "export", nu, asb_vm_export(vm, target_dir));
             return 0;
         }
 

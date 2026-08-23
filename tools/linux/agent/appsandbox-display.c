@@ -40,7 +40,7 @@
 #define VSOCK_PORT      2
 #define FRAME_MAGIC     0x52465341u   /* 'ASFR' little-endian */
 #define CURSOR_MAGIC    0x52435341u   /* 'ASCR' little-endian */
-#define TARGET_FPS      60
+#define TARGET_FPS      240  /* capture loop pace; actual send rate is gated by fb_id change */
 #define FRAME_INTERVAL_NS (1000000000L / TARGET_FPS)
 
 #define CURSOR_TYPE_MASKED_COLOR  1
@@ -651,6 +651,7 @@ have_card:
     clock_gettime(CLOCK_MONOTONIC, &next);
     uint64_t seq = 0;
     int last_status = 0;
+    uint32_t last_sent_fb_id = 0;  /* track last sent frame to skip duplicates */
 
     while (!g_stop) {
         int rc = drm_acquire_fb(&ctx);
@@ -664,9 +665,16 @@ have_card:
                 agent_log("capturing %ux%u stride=%u", ctx.width, ctx.height, ctx.stride);
                 last_status = 1;
             }
-            if (send_frame(client_fd, &ctx, ++seq) < 0) {
-                agent_log("client disconnected");
-                break;
+            /* Only send when the compositor has flipped to a new buffer
+             * (fb_id changed). This avoids sending duplicate frames at
+             * 240fps when the compositor renders at 144fps — the extra
+             * captures just do cheap DRM ioctls and skip the 16MB send. */
+            if (ctx.fb_id_last != last_sent_fb_id) {
+                if (send_frame(client_fd, &ctx, ++seq) < 0) {
+                    agent_log("client disconnected");
+                    break;
+                }
+                last_sent_fb_id = ctx.fb_id_last;
             }
         }
 

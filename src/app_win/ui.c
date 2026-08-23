@@ -892,6 +892,7 @@ static void on_webview2_message(const wchar_t *json)
         wchar_t name_buf[256] = {0}, os_buf[32] = {0}, img_buf[MAX_PATH] = {0};
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[128] = {0};
         wchar_t adapter_buf[256] = {0};
+        wchar_t storage_buf[MAX_PATH] = {0};
         int val;
         BOOL is_tpl = FALSE;
 
@@ -902,6 +903,7 @@ static void on_webview2_message(const wchar_t *json)
         json_get_string(json, L"adminUser", user_buf, 128);
         json_get_string(json, L"adminPass", pass_buf, 128);
         json_get_string(json, L"netAdapter", adapter_buf, 256);
+        json_get_string(json, L"storagePath", storage_buf, MAX_PATH);
         json_get_bool(json, L"isTemplate", &is_tpl);
 
         ZeroMemory(&cfg, sizeof(cfg));
@@ -913,6 +915,7 @@ static void on_webview2_message(const wchar_t *json)
         cfg.password = pass_buf;
         cfg.net_adapter = adapter_buf;
         cfg.is_template = is_tpl;
+        cfg.storage_path = storage_buf[0] ? storage_buf : NULL;
 
         if (json_get_int(json, L"hddGb", &val)) cfg.hdd_gb = (DWORD)val;
         if (json_get_int(json, L"ramMb", &val)) cfg.ram_mb = (DWORD)val;
@@ -1073,6 +1076,100 @@ static void on_webview2_message(const wchar_t *json)
             jb_string(&jb, L"path", file);
             jb_object_end(&jb);
             webview2_post(json_buf);
+        }
+    } else if (wcscmp(action, L"browseStorage") == 0) {
+        /* Folder picker for custom VM storage location */
+        BROWSEINFOW bi;
+        wchar_t folder[MAX_PATH] = { 0 };
+        ZeroMemory(&bi, sizeof(bi));
+        bi.hwndOwner = g_hwnd_main;
+        bi.pszDisplayName = folder;
+        bi.lpszTitle = L"Select VM storage folder";
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
+        LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+        if (pidl) {
+            wchar_t path[MAX_PATH] = { 0 };
+            if (SHGetPathFromIDListW(pidl, path)) {
+                wchar_t json_buf[2048];
+                JsonBuilder jb;
+                jb_init(&jb, json_buf, 2048);
+                jb_object_begin(&jb);
+                jb_string(&jb, L"type", L"browseStorageResult");
+                jb_string(&jb, L"path", path);
+                jb_object_end(&jb);
+                webview2_post(json_buf);
+            }
+            CoTaskMemFree(pidl);
+        }
+    } else if (wcscmp(action, L"exportVm") == 0) {
+        int idx;
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
+            BROWSEINFOW bi;
+            wchar_t folder[MAX_PATH] = { 0 };
+            ZeroMemory(&bi, sizeof(bi));
+            bi.hwndOwner = g_hwnd_main;
+            bi.pszDisplayName = folder;
+            bi.lpszTitle = L"Select export destination folder";
+            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
+            LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+            if (pidl) {
+                wchar_t path[MAX_PATH] = { 0 };
+                if (SHGetPathFromIDListW(pidl, path)) {
+                    HRESULT hr = asb_vm_export(asb_vm_get(idx), path);
+                    wchar_t json_buf[1024];
+                    JsonBuilder jb;
+                    jb_init(&jb, json_buf, 1024);
+                    jb_object_begin(&jb);
+                    jb_string(&jb, L"type", L"exportResult");
+                    jb_string(&jb, L"result", SUCCEEDED(hr) ? L"ok" : L"error");
+                    jb_object_end(&jb);
+                    webview2_post(json_buf);
+                    if (SUCCEEDED(hr))
+                        ui_log(L"Exported VM to: %s", path);
+                    else
+                        ui_log(L"Export failed (0x%08X)", hr);
+                }
+                CoTaskMemFree(pidl);
+            }
+        }
+    } else if (wcscmp(action, L"importVm") == 0) {
+        OPENFILENAMEW ofn;
+        wchar_t file[MAX_PATH] = { 0 };
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = g_hwnd_main;
+        ofn.lpstrFilter = L"VHDX Files (*.vhdx)\0*.vhdx\0All Files\0*.*\0";
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        ofn.lpstrTitle = L"Select VHDX file to import";
+        if (GetOpenFileNameW(&ofn)) {
+            /* Derive VM name from filename (strip path + .vhdx) */
+            wchar_t vm_name[256] = { 0 };
+            wchar_t *base = wcsrchr(file, L'\\');
+            base = base ? base + 1 : file;
+            wcsncpy_s(vm_name, 256, base, _TRUNCATE);
+            wchar_t *dot = wcsrchr(vm_name, L'.');
+            if (dot) *dot = L'\0';
+            /* Check for name collision, append _imported if needed */
+            if (asb_vm_find(vm_name)) {
+                wcscat_s(vm_name, 256, L"_imported");
+            }
+            HRESULT hr = asb_vm_import(file, vm_name, NULL, NULL);
+            wchar_t json_buf[1024];
+            JsonBuilder jb;
+            jb_init(&jb, json_buf, 1024);
+            jb_object_begin(&jb);
+            jb_string(&jb, L"type", L"importResult");
+            jb_string(&jb, L"result", SUCCEEDED(hr) ? L"ok" : L"error");
+            jb_object_end(&jb);
+            webview2_post(json_buf);
+            if (SUCCEEDED(hr)) {
+                ui_log(L"Imported VM: %s", vm_name);
+                send_vm_list();
+            } else {
+                ui_log(L"Import failed (0x%08X)", hr);
+            }
         }
     } else if (wcscmp(action, L"snapTake") == 0) {
         int vi;
