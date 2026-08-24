@@ -9,7 +9,7 @@
  * when the host sends gpu_query_response with share metadata.
  *
  * Supports: ping, shutdown, restart, gpu_copy, gpu_query_response,
- *           gpu_none, idd_connect, set_ip.
+ *           gpu_none, idd_connect, set_ip, set_resolution.
  *
  * Usage:
  *   appsandbox-agent.exe --install   Install and start the service
@@ -34,6 +34,7 @@
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "userenv.lib")
+#pragma comment(lib, "user32.lib")
 
 /* GUID_DEVCLASS_DISPLAY = {4D36E968-E325-11CE-BFC1-08002BE10318} */
 static const GUID GUID_DISPLAY_CLASS =
@@ -1742,6 +1743,42 @@ static void handle_idd_connect(AsbConn *client, const char *tag)
     send_reply(client, tag, "ok");
 }
 
+/* Change the mode of the AppSandbox indirect display.  The command arrives
+   as set_resolution:<width>x<height>.  ChangeDisplaySettingsEx is used here
+   rather than changing the VDD directly: Windows validates the requested
+   mode against the modes reported by IddCx and then drives the normal swap
+   chain reconfiguration path. */
+static void handle_set_resolution(AsbConn *client, const char *tag, const char *cmd)
+{
+    unsigned int width = 0, height = 0;
+    DEVMODEW dm;
+    LONG result;
+
+    if (sscanf_s(cmd, "set_resolution:%ux%u", &width, &height) != 2 ||
+        width < 640 || height < 480 || width > 7680 || height > 4320) {
+        agent_log("set_resolution: bad format: %s", cmd);
+        send_reply(client, tag, "error:bad_format");
+        return;
+    }
+
+    ZeroMemory(&dm, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+    dm.dmPelsWidth = width;
+    dm.dmPelsHeight = height;
+
+    result = ChangeDisplaySettingsExW(NULL, &dm, NULL,
+                                      CDS_UPDATEREGISTRY | CDS_FULLSCREEN, NULL);
+    if (result == DISP_CHANGE_SUCCESSFUL) {
+        agent_log("set_resolution: changed to %ux%u", width, height);
+        send_reply(client, tag, "ok");
+    } else {
+        agent_log("set_resolution: ChangeDisplaySettingsEx failed for %ux%u (0x%lX)",
+                  width, height, result);
+        send_reply(client, tag, "error:display_change_failed");
+    }
+}
+
 /* ---- Persistent client handler ---- */
 
 /* Disable the Hyper-V synthetic video adapter (if present).
@@ -2036,6 +2073,9 @@ static void handle_client(AsbConn *client)
         }
         else if (strcmp(cmd, "idd_connect") == 0) {
             handle_idd_connect(client, tag);
+        }
+        else if (strncmp(cmd, "set_resolution:", 15) == 0) {
+            handle_set_resolution(client, tag, cmd);
         }
         else {
             REPLY("error:unknown");
