@@ -124,7 +124,7 @@ static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig,
     sig->pixelRate                               = (UINT64)60 * width * height;
 }
 
-static void VddFillMonitorMode(IDDCX_MONITOR_MODE* mode, UINT index, UINT origin)
+static void VddFillMonitorMode(IDDCX_MONITOR_MODE* mode, UINT index, IDDCX_MONITOR_MODE_ORIGIN  origin)
 {
     mode->Size = sizeof(*mode);
     mode->Origin = origin;
